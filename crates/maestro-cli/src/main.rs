@@ -211,6 +211,9 @@ fn cmd_doctor(profile: Option<&str>) -> Result<()> {
             println!();
             println!("capability probe:");
             print_probe(&report.probe);
+            println!();
+            println!("model auth:");
+            print_model_auth(&report.model_auth);
             Ok(())
         }
         Response::Error { message } => bail!("daemon error: {message}"),
@@ -245,6 +248,38 @@ fn print_probe(probe: &serde_json::Value) {
         println!(
             "{}",
             serde_json::to_string_pretty(probe).unwrap_or_else(|_| probe.to_string())
+        );
+    }
+}
+
+/// Pretty-print the per-role model auth section. Each configured role is
+/// printed on one line: `  <role>: <model> [<backend>] — <status>`.
+/// Falls back to raw JSON if the value is not an object.
+fn print_model_auth(model_auth: &serde_json::Value) {
+    const ROLE_ORDER: &[&str] = &["tier0", "tier1", "tier2", "verifier_floor", "shim"];
+    if let Some(obj) = model_auth.as_object() {
+        // Print in canonical order first, then any unexpected extras.
+        for role in ROLE_ORDER {
+            if let Some(entry) = obj.get(*role) {
+                let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                let backend = entry.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
+                let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("  {role}: {model} [{backend}] \u{2014} {status}");
+            }
+        }
+        // Any extra keys not in ROLE_ORDER.
+        for (k, entry) in obj {
+            if !ROLE_ORDER.contains(&k.as_str()) {
+                let model = entry.get("model").and_then(|v| v.as_str()).unwrap_or("?");
+                let backend = entry.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
+                let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("  {k}: {model} [{backend}] \u{2014} {status}");
+            }
+        }
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(model_auth).unwrap_or_else(|_| model_auth.to_string())
         );
     }
 }

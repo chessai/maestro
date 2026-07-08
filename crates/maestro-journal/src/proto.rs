@@ -179,4 +179,10 @@ pub struct DoctorReport {
     pub resolved_profile: serde_json::Value,
     /// The capability-probe payload, filled by the daemon.
     pub probe: serde_json::Value,
+    /// Per-role model authentication status (ADR-004). A JSON object keyed by
+    /// role slot (tier0, tier1, tier2, verifier_floor, shim), each entry
+    /// carrying `{ model, backend, status }`. The check is purely offline:
+    /// credential presence + backend resolvability + (for driven CLIs)
+    /// command-on-PATH. No network calls are made.
+    pub model_auth: serde_json::Value,
 }

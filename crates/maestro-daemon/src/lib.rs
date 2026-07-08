@@ -10,6 +10,7 @@
 pub mod credentials;
 pub mod delegate;
 pub mod gate;
+pub mod model_auth;
 pub mod resolve;
 pub mod shim;
 pub mod startup;
@@ -905,10 +906,22 @@ fn doctor(opts: &Options) -> Response {
     let probe = serde_json::to_value(maestro_sandbox::probe())
         .unwrap_or_else(|e| serde_json::json!({ "error": format!("probe serialize: {e}") }));
 
+    // Build the per-role model-auth check (offline: credential presence +
+    // PATH scan only, no network calls — ADR-004).
+    let model_auth = match &res.resolved {
+        Ok(rp) => model_auth::build_model_auth(
+            &rp.roles,
+            &model_auth::real_env_has,
+            &model_auth::real_cmd_on_path,
+        ),
+        Err(_) => serde_json::json!({ "error": "profile resolution failed; cannot check model auth" }),
+    };
+
     Response::Doctor(DoctorReport {
         profile: res.profile,
         resolved_profile,
         probe,
+        model_auth,
     })
 }
 

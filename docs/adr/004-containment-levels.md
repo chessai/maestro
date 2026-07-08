@@ -12,7 +12,7 @@ Subagents — especially Codex, which takes liberties — need capability contai
 
 At daemon startup, probe and cache: `nix` (flakes usable), `bwrap` (Linux), Seatbelt (macOS, always present), container runtime, agent-native sandboxing (Codex CLI ships Seatbelt/Landlock+seccomp; Claude Code has permission modes). Probe results are queryable (`maestro doctor`).
 
-The probe also **auth-checks each configured role model** (ADR-007): reachability + credentials for every tier's model and the verifier floor. A missing key or unreachable endpoint surfaces at setup via `maestro doctor` rather than only at first delegation (where it would still fail `model_unavailable`). (planned; v1 probes host capabilities only — model auth still surfaces as `model_unavailable` at first delegation)
+The probe also **auth-checks each configured role model** (ADR-007) and surfaces the result in `maestro doctor` (a `model_auth` section, one line per role): for every configured tier, the verifier floor, and the shim, it reports the backend and an **offline** status — credential presence (`missing_credential:ANTHROPIC_API_KEY` / `…OPENAI_API_KEY`), driven-CLI command-on-PATH (`command_not_found:<prog>`), `unconfigured:base_url`, or `ok`. A missing key surfaces at setup rather than only at first delegation (where it would still fail `model_unavailable`). The check is deliberately **offline** — no live API ping — so `doctor` works on a network-less or config-less machine; live reachability probing remains a future refinement.
 
 ### Levels
 
