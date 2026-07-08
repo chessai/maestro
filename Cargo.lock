@@ -799,6 +799,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "tiny_http",
  "tokio",
  "toml",
  "tracing",

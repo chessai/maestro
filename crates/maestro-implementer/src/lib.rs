@@ -43,6 +43,11 @@ pub struct ImplementerTask {
     pub house_rules: String,
     /// The model id, e.g. `"claude-sonnet-4-6"` or `"mock"`.
     pub model: String,
+    /// The `X-Maestro-Task` header value sent on each upstream request when the
+    /// backend is routed through the daemon's streaming credential proxy (ADR-006).
+    /// `None` on the default (proxy-off) path — no header is sent. This is a
+    /// transport concern only; it never enters `build_request_body`.
+    pub task_header: Option<String>,
 }
 
 /// A *descriptive*, non-authoritative account of what a backend did.

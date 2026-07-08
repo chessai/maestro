@@ -97,7 +97,7 @@ impl ImplementerBackend for AnthropicBackend {
             turns += 1;
 
             let body = build_request_body(task, &messages);
-            let response = send(&url, &api_key, &body)?;
+            let response = send(&url, &api_key, task.task_header.as_deref(), &body)?;
 
             // Accumulate usage across turns.
             if let Some(usage) = response.get("usage") {
@@ -285,12 +285,30 @@ pub fn build_request_body(task: &ImplementerTask, prior_messages: &[Value]) -> V
 /// Send one request and parse the JSON response, mapping transport/status
 /// errors to [`ImplementerError::Http`] and parse failures to
 /// [`ImplementerError::Protocol`].
-fn send(url: &str, api_key: &str, body: &Value) -> Result<Value, ImplementerError> {
-    let resp = ureq::post(url)
+///
+/// When `task_header` is `Some`, the request carries an `X-Maestro-Task` header
+/// so the daemon's streaming credential proxy can meter usage per task and
+/// hard-stop at the token ceiling (ADR-006). On the default (proxy-off) path
+/// `task_header` is `None` and no such header is sent — the request is
+/// byte-for-byte identical to before.
+///
+/// The proxy signals a between-request budget stop with a `429` whose body
+/// carries `budget_exhausted`; that case maps to [`ImplementerError::Budget`]
+/// (a terminal ceiling stop) rather than the generic [`ImplementerError::Http`].
+fn send(
+    url: &str,
+    api_key: &str,
+    task_header: Option<&str>,
+    body: &Value,
+) -> Result<Value, ImplementerError> {
+    let mut req = ureq::post(url)
         .set("x-api-key", api_key)
         .set("anthropic-version", ANTHROPIC_VERSION)
-        .set("content-type", "application/json")
-        .send_json(body);
+        .set("content-type", "application/json");
+    if let Some(tid) = task_header {
+        req = req.set("X-Maestro-Task", tid);
+    }
+    let resp = req.send_json(body);
 
     match resp {
         Ok(r) => r
@@ -300,6 +318,13 @@ fn send(url: &str, api_key: &str, body: &Value) -> Result<Value, ImplementerErro
             let detail = r
                 .into_string()
                 .unwrap_or_else(|_| "<unreadable body>".into());
+            // The proxy's pre-forward budget gate returns 429 with a
+            // `budget_exhausted` body; map it to a terminal Budget stop.
+            if code == 429 && detail.contains("budget_exhausted") {
+                return Err(ImplementerError::Budget(
+                    "task token ceiling reached (proxy)".into(),
+                ));
+            }
             Err(ImplementerError::Http(format!("status {code}: {detail}")))
         }
         Err(ureq::Error::Transport(t)) => {
@@ -343,6 +368,7 @@ mod tests {
             worktree,
             house_rules: house_rules.into(),
             model: model.into(),
+            task_header: None,
         }
     }
 

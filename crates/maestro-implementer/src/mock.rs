@@ -95,6 +95,7 @@ mod tests {
             worktree: worktree.to_path_buf(),
             house_rules: String::new(),
             model: "mock".into(),
+            task_header: None,
         }
     }
 

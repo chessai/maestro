@@ -111,8 +111,9 @@ pub struct SharedState {
 
 /// The started streaming-credential-proxy: its shared token ledger and the
 /// address it bound. Held so the ledger stays alive for the daemon's lifetime;
-/// the server thread runs detached. The bound addr is retained for the eventual
-/// backend wire-up (routing metered backends through this address).
+/// the server thread runs detached. The bound addr is handed to the delegation
+/// state so the implementer backend routes its Anthropic calls through this
+/// address (metered + hard-stopped per task).
 #[allow(dead_code)]
 struct ProxyRuntime {
     ledger: Arc<maestro_proxy::Ledger>,
@@ -173,14 +174,20 @@ impl Server {
         //    OFF: when disabled we do nothing and the live path is unchanged.
         //    When enabled, create the shared token ledger, spawn the proxy server
         //    (keys injected from ANTHROPIC_API_KEY, never entering the sandbox),
-        //    and hand the ledger to the delegation state so `run_pipeline`
-        //    registers each task's ceiling. Registration is side-effect-only
-        //    until backends are routed (see the wire-up TODO in `select_backend`).
+        //    and hand the ledger + bound addr to the delegation state so
+        //    `run_pipeline` registers each task's ceiling and `run_attempt` routes
+        //    the implementer backend's Anthropic calls through the proxy address.
         let proxy = start_proxy(opts.profile.as_deref());
         let proxy_ledger = proxy.as_ref().map(|p| Arc::clone(&p.ledger));
+        let proxy_addr = proxy.as_ref().map(|p| p.addr.to_string());
 
-        let delegation =
-            DelegationState::new(journal, machine_cap, opts.profile.clone(), proxy_ledger);
+        let delegation = DelegationState::new(
+            journal,
+            machine_cap,
+            opts.profile.clone(),
+            proxy_ledger,
+            proxy_addr,
+        );
 
         // 5a. Reconcile orphaned in-flight tasks from a prior daemon instance
         //     BEFORE serving begins (ADR-006). Any task in a non-terminal state

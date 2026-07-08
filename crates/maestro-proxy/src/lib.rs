@@ -111,6 +111,21 @@ fn handle(
     let anthropic_version =
         header_value(&request, "anthropic-version").unwrap_or_else(|| cfg.anthropic_version.clone());
 
+    // Pre-forward budget gate: enforce the CUMULATIVE token ceiling BETWEEN
+    // requests. The implementer is a multi-turn NON-streaming loop, so once a
+    // turn's response pushes the ledger over the ceiling, the NEXT turn's request
+    // is rejected HERE — without forwarding upstream. (The mid-stream hard-stop in
+    // the streaming path complements this for streamed responses.)
+    if let Some(tid) = task_id.as_deref() {
+        if ledger.over_budget(tid) {
+            return respond_json(
+                request,
+                429,
+                r#"{"error":{"type":"budget_exhausted","message":"task token ceiling already reached"}}"#,
+            );
+        }
+    }
+
     // Read the request body (JSON).
     let mut request = request;
     let mut body = String::new();

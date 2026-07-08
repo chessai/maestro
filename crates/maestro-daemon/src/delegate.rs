@@ -60,9 +60,17 @@ pub struct DelegationState {
     /// The streaming credential proxy's shared token ledger (ADR-006 / ADR-004),
     /// present only when the proxy is enabled (OPT-IN; default `None`). When set,
     /// `run_pipeline` registers each task's token ceiling here so the proxy can
-    /// meter usage + hard-stop mid-stream. Side-effect-only until backends are
-    /// routed through the proxy — see the wire-up TODO in `select_backend`.
+    /// meter usage + hard-stop. The implementer backend is routed through the
+    /// proxy in `run_attempt` (via `proxy_addr` below) when this is `Some`.
     proxy_ledger: Option<Arc<maestro_proxy::Ledger>>,
+    /// The bound address of the streaming credential proxy (ADR-006), present
+    /// only when the proxy is enabled (OPT-IN; default `None`). When set, the
+    /// one-shot implementer backend is built targeting `http://{addr}` INSTEAD of
+    /// the role's upstream base_url, so its Anthropic calls route through the
+    /// proxy (which injects the key + meters + hard-stops on the ceiling). Only
+    /// the implementer is routed — never the verifier or shim (ADR-002:
+    /// verification is never skipped). `None` on the default path.
+    proxy_addr: Option<String>,
 }
 
 struct Slots {
@@ -79,6 +87,7 @@ impl DelegationState {
         machine_cap: u32,
         profile_flag: Option<String>,
         proxy_ledger: Option<Arc<maestro_proxy::Ledger>>,
+        proxy_addr: Option<String>,
     ) -> Arc<Self> {
         Arc::new(DelegationState {
             journal: Arc::new(Mutex::new(journal)),
@@ -91,6 +100,7 @@ impl DelegationState {
             caps: maestro_sandbox::probe(),
             live_sessions: Mutex::new(HashMap::new()),
             proxy_ledger,
+            proxy_addr,
         })
     }
 
@@ -293,12 +303,13 @@ pub fn select_backend(
         return Ok(Box::new(MockBackend));
     }
     match kind {
-        // TODO(proxy wire-up): route metered backends through proxy_base_url with
-        // X-Maestro-Task. When the proxy is enabled, override this backend's
-        // base_url to the daemon-local proxy address and set the X-Maestro-Task
-        // header to the task id, so the proxy injects the key upstream, meters
-        // token usage into the ledger, and hard-stops mid-stream on ceiling. Left
-        // unwired in this pass so the live path stays byte-for-byte unchanged.
+        // Proxy routing (ADR-006) is applied by the CALLER (`run_attempt`), which
+        // — when the proxy is enabled — passes `base_url = http://{proxy_addr}`
+        // here for the non-mock anthropic path and sets the task's
+        // `X-Maestro-Task` header, so the proxy injects the key upstream, meters
+        // usage into the ledger, and hard-stops on the ceiling. This function just
+        // honors the `base_url` it is given; on the proxy-off path that is the
+        // role's upstream base_url and the live path is byte-for-byte unchanged.
         None | Some("anthropic") => Ok(Box::new(AnthropicBackend::new(base_url))),
         Some("driven_cli") => Err(DelegateError::ModelUnavailable(
             "driven_cli backend is not available until M3".into(),
@@ -964,10 +975,11 @@ fn run_pipeline(
 
     // Proxy ledger registration (ADR-006 / ADR-004): when the streaming
     // credential proxy is enabled, tell its ledger this task's token ceiling so
-    // it can meter usage and hard-stop mid-stream once the ceiling is crossed.
-    // This is SIDE-EFFECT-ONLY in this pass: the backends are not yet routed
-    // through the proxy (see the wire-up TODO in `select_backend`), so on both
-    // the flag-off and flag-on paths the live delegation behavior is unchanged.
+    // it can meter usage and hard-stop once the ceiling is crossed. Registered
+    // HERE — at pipeline start, before the first attempt runs — so the ceiling is
+    // populated before the implementer's first proxied request. A `None` ceiling
+    // is registered too (⇒ `over_budget` is well-defined = never over). The
+    // implementer backend is routed through the proxy in `run_attempt`.
     if let Some(ledger) = state.proxy_ledger.as_ref() {
         ledger.register(task_id, token_ceiling);
     }
@@ -1105,8 +1117,23 @@ fn run_attempt(
 
     // Select the backend up front (ADR-008). A kind that has become unavailable
     // still fails loud.
+    //
+    // Proxy routing (ADR-006): when the streaming credential proxy is enabled, the
+    // IMPLEMENTER's Anthropic backend is built targeting the daemon-local proxy
+    // (`http://{addr}`) INSTEAD of the role's upstream base_url, so the proxy
+    // injects the key upstream, meters usage into the ledger, and hard-stops on
+    // the ceiling. `select_backend`'s `mock` short-circuit still wins (a `mock`
+    // model/kind is never routed through the proxy), so we only override the
+    // base_url for the non-mock anthropic path. On the proxy-off path
+    // (`proxy_addr` is `None`) the role's base_url is used unchanged — the live
+    // path is byte-for-byte identical. The verifier + shim are never routed here.
+    let is_mock = model == "mock" || role.kind.as_deref() == Some("mock");
+    let backend_base_url = match state.proxy_addr.as_deref() {
+        Some(addr) if !is_mock => Some(format!("http://{addr}")),
+        _ => role.base_url.clone(),
+    };
     let backend =
-        select_backend(model, role.kind.as_deref(), role.base_url.clone()).map_err(|e| {
+        select_backend(model, role.kind.as_deref(), backend_base_url).map_err(|e| {
             fail("model_unavailable", e.message_public().to_string())
         })?;
 
@@ -1186,6 +1213,14 @@ fn run_attempt(
         worktree: worktree_path.clone(),
         house_rules,
         model: model.to_string(),
+        // Route metered usage to this task in the proxy's ledger (ADR-006). Only
+        // set when the proxy is enabled AND this is the non-mock anthropic path
+        // (the backend base_url was overridden to the proxy above); `None`
+        // otherwise, so no `X-Maestro-Task` header is sent on the default path.
+        task_header: match state.proxy_addr.as_deref() {
+            Some(_) if !is_mock => Some(task_id.to_string()),
+            _ => None,
+        },
     };
     match backend.run(&task) {
         Ok(outcome) => {
@@ -1202,6 +1237,15 @@ fn run_attempt(
             finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
             worktree::remove(repo, &worktree_path);
             return Err(fail("model_unavailable", m));
+        }
+        // A Budget stop — the implementer's own turn-budget exhaustion OR the
+        // proxy's pre-forward token-ceiling rejection (ADR-006) — is a terminal
+        // `budget_exhausted`, NOT an `internal_error`. Special-cased BEFORE the
+        // catch-all `other` arm. The worktree is removed on this path too.
+        Err(ImplementerError::Budget(m)) => {
+            finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
+            worktree::remove(repo, &worktree_path);
+            return Err(fail("budget_exhausted", m));
         }
         Err(other) => {
             finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);

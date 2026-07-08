@@ -236,6 +236,60 @@ fn non_streaming_meters_end_usage() {
     assert_eq!(g.api_key.as_deref(), Some("sk-test"));
 }
 
+// Pre-forward budget gate: a task already at (or over) its ceiling is rejected
+// with 429 budget_exhausted WITHOUT forwarding upstream. The mock upstream would
+// return 500 if it were reached, proving the request never left the proxy.
+#[test]
+fn over_budget_rejected_before_forwarding() {
+    // A mock upstream that returns 500 if it is ever reached.
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = server.server_addr().to_ip().unwrap();
+    let upstream = format!("http://{addr}");
+    let reached = Arc::new(AtomicBool::new(false));
+    let reached_c = Arc::clone(&reached);
+    std::thread::spawn(move || {
+        if let Ok(req) = server.recv() {
+            reached_c.store(true, Ordering::SeqCst);
+            let resp = tiny_http::Response::empty(500);
+            let _ = req.respond(resp);
+        }
+    });
+
+    let ledger = Arc::new(Ledger::new());
+    // Low ceiling, then push usage past it so the task is already over budget.
+    ledger.register("task-over", Some(50));
+    ledger.add_usage("task-over", 40, 20); // 60 >= 50 → over budget
+    assert!(ledger.over_budget("task-over"));
+
+    let (proxy_addr, _h) = maestro_proxy::spawn(
+        "127.0.0.1:0",
+        cfg(&upstream),
+        Arc::clone(&ledger),
+        key_provider("sk-test"),
+    )
+    .unwrap();
+
+    let (status, body) =
+        post_through_proxy(&proxy_addr.to_string(), r#"{"stream":false}"#, Some("task-over"));
+    assert_eq!(status, 429, "over-budget task must be rejected 429; body: {body}");
+    assert!(
+        body.contains("budget_exhausted"),
+        "429 body carries budget_exhausted; body: {body}"
+    );
+    assert!(
+        body.contains("task token ceiling already reached"),
+        "429 body carries the pre-forward message; body: {body}"
+    );
+
+    // Give any (erroneously) forwarded request a beat to arrive, then assert the
+    // upstream was NEVER reached.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !reached.load(Ordering::SeqCst),
+        "an over-budget request must NOT be forwarded upstream"
+    );
+}
+
 // Routing: a non-/v1/messages path is 404; a GET is 405.
 #[test]
 fn routing_404_and_405() {
