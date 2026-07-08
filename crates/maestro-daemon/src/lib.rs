@@ -7,6 +7,7 @@
 //! The crate is a library so integration tests can drive the server in-process
 //! (see [`serve_on`]); `src/main.rs` is a thin wrapper over [`run`].
 
+pub mod credentials;
 pub mod delegate;
 pub mod gate;
 pub mod resolve;
@@ -72,6 +73,9 @@ where
 /// until a termination signal. Blocks.
 pub fn run() -> Result<()> {
     init_tracing();
+    // Load credentials BEFORE Server::start (and before any worker threads
+    // spawn) so set_var is called in a single-threaded context (ADR-007).
+    credentials::load_credentials_into_env();
     let opts = options_from_args(std::env::args().skip(1));
     let server = Server::start(opts)?;
     server.serve_forever()

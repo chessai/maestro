@@ -104,3 +104,19 @@ pub fn socket_path() -> PathBuf {
 pub fn lock_path() -> PathBuf {
     runtime_dir().join("maestro.lock")
 }
+
+/// The credentials file: `<config dir>/maestro/credentials.toml` (ADR-007).
+/// Same directory as `config.toml`; a different filename so it can be
+/// `chmod 600` independently.
+pub fn credentials_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        app_support().join("maestro/credentials.toml")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        env_dir("XDG_CONFIG_HOME")
+            .unwrap_or_else(|| home().join(".config"))
+            .join("maestro/credentials.toml")
+    }
+}

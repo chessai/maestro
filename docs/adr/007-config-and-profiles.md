@@ -67,7 +67,7 @@ The following config knobs are defined in the schema but **not yet wired or enfo
 
 - **`advisor.context` compaction presentation** (`standard`/`1m`): the flag is read and stored, but the daemon does not yet switch between aggressive-summarize and inline-full presentation modes for inbox/report delivery.
 - **`tighten.*` factor enforcement** (`tighten.allowlist_factor`, `tighten.turn_factor`): values are computed and journaled on containment downgrade but are not yet applied to reduce budgets or allowlists at delegation time.
-- **`credentials.toml`**: the file path is reserved; in v1 secrets are read from environment variables only (the trait backend for keychain/agenix is not yet built).
+- **`credentials.toml` keychain/agenix backends**: the 0600 `[env]`-table file is loaded at daemon startup (permission-gated; environment always wins over the file), but the pluggable keychain/agenix trait backends are not yet built.
 - **`codex_tighten` and supervision-freedom multipliers**: the `codex_tighten` flag and the implied tightening from `advisor.context = "standard"` or containment downgrade are not yet applied to driven-CLI spec templates.
 
 The rest of the config — profile selection, model routing, containment levels, concurrency caps, watchdog timeout, downgrade policy, search backend, `shim.excerpt_cap_chars` (enforced as a hard char cap on `fetch_extract` verbatim spans), `lifetime.token_factor` (the derived task-lifetime token ceiling default = `token_factor × per-attempt-token-budget × ladder-tier-count`, applied when a spec sets a per-attempt token budget but no explicit lifetime token ceiling; an explicit `spec.lifetime_budget.tokens` still wins), and `advisor.writable_paths` — is wired and enforced in v1.

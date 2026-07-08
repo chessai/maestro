@@ -155,6 +155,24 @@ pub struct AdvisorConfig {
     pub writable_paths: Vec<String>,
 }
 
+/// The credentials file (ADR-007): a `[env]` table mapping env-var names to
+/// string values. Unknown top-level keys are ignored. At daemon startup each
+/// entry is injected into the process environment if the key is not already set.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Credentials {
+    /// `[env]` table: env-var name → value.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+impl Credentials {
+    /// Parse credentials from a TOML string. Unknown top-level keys are ignored
+    /// (serde deny-unknown-fields is intentionally NOT used here).
+    pub fn from_toml_str(s: &str) -> Result<Self> {
+        toml::from_str(s).map_err(|e| Error::Config(e.to_string()))
+    }
+}
+
 /// The `[defaults]` table (ADR-007). Every knob has a value here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Defaults {
@@ -444,6 +462,56 @@ roles.shim = { model = "cheap-local", base_url = "http://localhost:11434/v1" }
         assert_eq!(personal.shim_model(), "claude-haiku-4-5-fast");
         let work = &cfg.profiles.get("work").unwrap().roles;
         assert_eq!(work.shim_model(), "cheap-local");
+    }
+
+    // Credentials: [env] table parses into a BTreeMap of env-var → value pairs.
+    #[test]
+    fn credentials_parses_env_table() {
+        let toml = r#"
+[env]
+ANTHROPIC_API_KEY = "sk-ant-test"
+OPENAI_API_KEY = "sk-openai-test"
+"#;
+        let creds = Credentials::from_toml_str(toml).expect("credentials parse");
+        assert_eq!(creds.env.get("ANTHROPIC_API_KEY").map(|s| s.as_str()), Some("sk-ant-test"));
+        assert_eq!(creds.env.get("OPENAI_API_KEY").map(|s| s.as_str()), Some("sk-openai-test"));
+        assert_eq!(creds.env.len(), 2);
+    }
+
+    // Credentials: empty string → empty env map (no [env] section).
+    #[test]
+    fn credentials_empty_input_yields_empty_map() {
+        let creds = Credentials::from_toml_str("").expect("empty credentials parse");
+        assert!(creds.env.is_empty());
+
+        let creds2 = Credentials::from_toml_str("\n# just a comment\n").expect("comment-only parse");
+        assert!(creds2.env.is_empty());
+    }
+
+    // Credentials: unknown top-level keys are ignored gracefully.
+    #[test]
+    fn credentials_ignores_unknown_top_level_keys() {
+        let toml = r#"
+future_feature = "ignored"
+[env]
+ANTHROPIC_API_KEY = "sk-ant-test"
+[another_unknown_table]
+foo = "bar"
+"#;
+        let creds = Credentials::from_toml_str(toml).expect("credentials with unknown keys parse");
+        assert_eq!(creds.env.len(), 1);
+        assert_eq!(creds.env.get("ANTHROPIC_API_KEY").map(|s| s.as_str()), Some("sk-ant-test"));
+    }
+
+    // Credentials: no [env] section but other keys → empty map.
+    #[test]
+    fn credentials_no_env_section_yields_empty_map() {
+        let toml = r#"
+[other]
+foo = "bar"
+"#;
+        let creds = Credentials::from_toml_str(toml).expect("no-env-section parse");
+        assert!(creds.env.is_empty());
     }
 
     // A bare-string role stays RoleModel::Bare (⇒ default anthropic backend,
