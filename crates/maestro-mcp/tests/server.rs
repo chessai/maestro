@@ -86,7 +86,7 @@ fn ac4_initialize_defaults_protocol_version() {
 
 // AC5: tools/list.
 #[test]
-fn ac5_tools_list_has_exactly_the_seven_tools() {
+fn ac5_tools_list_has_exactly_the_eight_tools() {
     let (fake, _rec) = FakeTransport::new(vec![]);
     let fake = Box::new(fake);
     let mut server = McpServer::new(fake, None);
@@ -94,12 +94,13 @@ fn ac5_tools_list_has_exactly_the_seven_tools() {
     let v = parse(&server.handle_line(&line).unwrap());
 
     let tools = v["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 7, "exactly seven tools (M1 + M2 + M3 + ADR-005)");
+    assert_eq!(tools.len(), 8, "exactly eight tools (M1 + M2 + M3 + ADR-005 + merge_task)");
 
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"delegate"));
     assert!(names.contains(&"task_status"));
     assert!(names.contains(&"close_task"));
+    assert!(names.contains(&"merge_task"));
     assert!(names.contains(&"journal_query"));
     assert!(names.contains(&"kill_task"));
     assert!(names.contains(&"search"));

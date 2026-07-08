@@ -47,7 +47,7 @@ Two write channels are carved out of the read-only mount:
 
 `delegate(task_spec)`, `task_status(filter?)`, `kill_task(task_id)`, `close_task(task_id, outcome, successor?)` (resolves `blocked` tasks: `abandoned` | `superseded`), `merge_task(task_id)` (bypass-only), `search(queries)`, `fetch_extract(url, schema)`, `journal_query(named_query, params)` (curated read-only queries: recent traces, verifier reports, cost summaries — not raw SQL).
 
-**v1:** `merge_task` (bypass-only auto-merge) is planned but not yet built; merging is human-only (`git`/PR) in v1. See also Merge path below.
+**v1:** `merge_task` is built as an explicit advisor-initiated action gated on the task's resting `verify_passed` state; it performs a **fast-forward-only** merge of `maestro/<task-ulid>` into the task's base branch (compare-and-swap `update-ref` when the base is not checked out; `merge --ff-only` on a clean checked-out base), refuses non-ff / dirty / non-branch bases with a structured error, and emits the `merged` event. The daemon still never merges on its own — merge happens only on this explicit request. The bypass-mode restriction is a client-side Claude Code permission concern (unverifiable from the daemon). See also Merge path below.
 
 ### Notification
 
@@ -69,7 +69,7 @@ Because the daemon owns PTYs in-process, a daemon restart (the version-skew reme
 
 Verified work sits on `maestro/<task-ulid>`. Never auto-merged. The advisor presents diff summary + verifier report; merging is a human git/PR action, or `merge_task` in bypass mode (fast-forward or merge commit into the task's base ref; conflicts → task `blocked`, never auto-resolved).
 
-**v1:** merging is human-only (`git`/PR); `merge_task` (bypass-only auto-merge) and the `merged` event (ADR-001) are planned, not yet built.
+**v1:** `merge_task` performs a fast-forward-only merge into the task's base branch and emits the `merged` event (ADR-001); non-ff / conflicting merges are refused with a structured error (the human resolves them via `git`/PR), never auto-resolved to `blocked`.
 
 ### API proxying and cost
 

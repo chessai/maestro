@@ -22,6 +22,13 @@ fn worktrees_root() -> PathBuf {
     paths::state_dir().join("worktrees")
 }
 
+/// The conventional worktree path for a task: `<state_dir>/worktrees/<task_id>`.
+/// This is where [`create`] places the worktree; the merge cleanup path uses it
+/// to detach the worktree before deleting the merged branch.
+pub fn worktree_path(task_id: &str) -> PathBuf {
+    worktrees_root().join(task_id)
+}
+
 /// Run `git` with `args`, returning combined stdout/stderr on success or an
 /// error carrying the captured output on failure.
 fn git(args: &[&str]) -> Result<String> {
@@ -141,6 +148,125 @@ pub fn snapshot_diff(worktree: &Path, base_ref: &str) -> String {
     }
 }
 
+/// The result of a successful [`merge_task_branch`]: the base ref now points at
+/// `merged_sha` (the tip of the task branch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// The commit the base ref was fast-forwarded to (the task branch tip).
+    pub merged_sha: String,
+    /// The base branch that was advanced (a bare branch name, e.g. `main`).
+    pub base_ref: String,
+    /// The task branch that was merged (`maestro/<task_id>`).
+    pub branch: String,
+}
+
+/// Run `git` scoped to `repo`, returning trimmed stdout on success. Uses the same
+/// combined-output error as [`git`]. Convenience wrapper for the merge helpers.
+fn git_c(repo: &str, args: &[&str]) -> Result<String> {
+    let mut full = vec!["-C", repo];
+    full.extend_from_slice(args);
+    git(&full).map(|s| s.trim().to_string())
+}
+
+/// `true` iff `git -C repo <args>` exits 0. Used for boolean git probes
+/// (`merge-base --is-ancestor`, `rev-parse --verify`) where the exit code, not
+/// the output, is the answer.
+fn git_ok(repo: &str, args: &[&str]) -> bool {
+    let mut full = vec!["-C", repo];
+    full.extend_from_slice(args);
+    Command::new("git")
+        .args(&full)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Fast-forward-merge the passed task's branch `maestro/<task_id>` into
+/// `base_ref` (ADR-006, advisor-initiated `merge_task`). This is fast-forward
+/// ONLY and NEVER disturbs a working tree it does not have to.
+///
+/// The branch was cut off `base_ref` and only added commits, so it is normally a
+/// fast-forward of `base_ref`. Steps:
+/// 1. resolve `task_sha` from `refs/heads/maestro/<task_id>` (missing → error);
+/// 2. require `base_ref` to name an existing LOCAL branch (a SHA / tag / missing
+///    branch → error, "merge manually");
+/// 3. fast-forward guard: `base_sha` must be an ancestor of `task_sha`
+///    (not-ff → error, no merge performed);
+/// 4. if `base_ref` is the checked-out branch, require a clean working tree and
+///    `merge --ff-only`; otherwise advance the ref with a compare-and-swap
+///    `update-ref refs/heads/<base_ref> <task_sha> <base_sha>` (no working tree
+///    is touched).
+///
+/// On success returns the [`MergeOutcome`]; the caller emits `merged`, removes
+/// the worktree, and best-effort deletes the task branch.
+pub fn merge_task_branch(repo_path: &Path, base_ref: &str, task_id: &str) -> Result<MergeOutcome> {
+    let repo = repo_path.to_str().context("repo path is not valid UTF-8")?;
+    let branch = format!("maestro/{task_id}");
+    let branch_ref = format!("refs/heads/{branch}");
+
+    // 1. Resolve the task branch tip.
+    let task_sha = git_c(repo, &["rev-parse", "--verify", "--quiet", &branch_ref])
+        .with_context(|| format!("task branch {branch} is missing; nothing to merge"))?;
+
+    // 2. Require base_ref to be a local branch (not a SHA / tag / detached).
+    let base_branch_ref = format!("refs/heads/{base_ref}");
+    if !git_ok(repo, &["rev-parse", "--verify", "--quiet", &base_branch_ref]) {
+        bail!("base_ref '{base_ref}' is not a local branch; merge manually");
+    }
+    let base_sha = git_c(repo, &["rev-parse", "--verify", &base_branch_ref])?;
+
+    // 3. Fast-forward guard: base must be an ancestor of the task tip.
+    if !git_ok(repo, &["merge-base", "--is-ancestor", &base_sha, &task_sha]) {
+        bail!(
+            "base '{base_ref}' has advanced since the task branched; \
+             not a fast-forward — rebase/merge manually"
+        );
+    }
+
+    // 4. Advance the base ref. If base_ref is checked out, do a real ff merge
+    //    (requiring a clean tree); otherwise a working-tree-free ref update.
+    let checked_out = git_c(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .filter(|h| h == base_ref)
+        .is_some();
+
+    if checked_out {
+        let status = git_c(repo, &["status", "--porcelain"])?;
+        if !status.is_empty() {
+            bail!(
+                "base branch '{base_ref}' is checked out with a dirty working tree; \
+                 commit/stash then merge"
+            );
+        }
+        git_c(repo, &["merge", "--ff-only", &branch_ref])
+            .with_context(|| format!("fast-forwarding {base_ref} to {branch}"))?;
+    } else {
+        // Compare-and-swap: the old-value arg makes this safe against races.
+        git_c(
+            repo,
+            &["update-ref", &base_branch_ref, &task_sha, &base_sha],
+        )
+        .with_context(|| format!("fast-forwarding ref {base_ref} to {branch}"))?;
+    }
+
+    Ok(MergeOutcome {
+        merged_sha: task_sha,
+        base_ref: base_ref.to_string(),
+        branch,
+    })
+}
+
+/// Best-effort deletion of a task's branch `maestro/<task_id>` (`git branch -D`).
+/// Errors are swallowed: post-merge branch cleanup is never load-bearing.
+pub fn delete_branch(repo_path: &Path, task_id: &str) {
+    if let Some(repo) = repo_path.to_str() {
+        let branch = format!("maestro/{task_id}");
+        let _ = Command::new("git")
+            .args(["-C", repo, "branch", "-D", &branch])
+            .output();
+    }
+}
+
 /// Best-effort removal of a worktree (`git worktree remove --force`). Errors are
 /// swallowed: cleanup is never allowed to fail a task.
 pub fn remove(repo_path: &Path, worktree: &Path) {
@@ -193,5 +319,92 @@ mod tests {
         std::fs::write(wt.path().join("a.txt"), "1\n").unwrap();
         assert!(commit_all(wt.path(), "add a").unwrap(), "dirty tree = commit");
         remove(repo.path(), wt.path());
+    }
+
+    /// Add a `maestro/<task_id>` branch off `HEAD` with one extra commit, without
+    /// leaving a worktree attached. Returns the task branch's tip SHA.
+    fn add_task_branch(repo: &Path, task_id: &str) -> String {
+        let rp = repo.to_str().unwrap();
+        let branch = format!("maestro/{task_id}");
+        let wt = TempDir::new().unwrap();
+        let wtp = wt.path().to_str().unwrap();
+        git(&["-C", rp, "worktree", "add", wtp, "-b", &branch, "HEAD"]).unwrap();
+        std::fs::write(wt.path().join("feature.txt"), "feature\n").unwrap();
+        git(&["-C", wtp, "add", "-A"]).unwrap();
+        git(&["-C", wtp, "commit", "-q", "-m", "feature"]).unwrap();
+        let tip = git(&["-C", rp, "rev-parse", &format!("refs/heads/{branch}")])
+            .unwrap()
+            .trim()
+            .to_string();
+        // Detach the worktree so the branch is not checked out anywhere.
+        remove(repo, wt.path());
+        tip
+    }
+
+    fn head_of(repo: &Path, r: &str) -> String {
+        git(&["-C", repo.to_str().unwrap(), "rev-parse", r])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn merge_ff_when_base_not_checked_out() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let task_tip = add_task_branch(rp, "ff1");
+        // Detach HEAD so `main` is NOT the checked-out branch → update-ref path.
+        let main_sha = head_of(rp, "main");
+        git(&["-C", rp.to_str().unwrap(), "checkout", "-q", "--detach", &main_sha]).unwrap();
+
+        let out = merge_task_branch(rp, "main", "ff1").expect("ff merge succeeds");
+        assert_eq!(out.merged_sha, task_tip);
+        assert_eq!(out.base_ref, "main");
+        assert_eq!(out.branch, "maestro/ff1");
+        // `main` now points at the task commit; the working tree was untouched.
+        assert_eq!(head_of(rp, "main"), task_tip, "main advanced to task tip");
+    }
+
+    #[test]
+    fn merge_refused_when_not_fast_forward() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let rps = rp.to_str().unwrap();
+        let _task_tip = add_task_branch(rp, "nf1");
+        // Advance `main` with an extra commit AFTER branching so the task branch
+        // is no longer a fast-forward of main.
+        std::fs::write(rp.join("other.txt"), "x\n").unwrap();
+        git(&["-C", rps, "add", "-A"]).unwrap();
+        git(&["-C", rps, "commit", "-q", "-m", "advance main"]).unwrap();
+        let main_before = head_of(rp, "main");
+
+        let err = merge_task_branch(rp, "main", "nf1").expect_err("non-ff must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("fast-forward") || msg.contains("advanced"),
+            "error mentions the ff failure, got: {msg}"
+        );
+        // main was not moved and no merge was performed.
+        assert_eq!(head_of(rp, "main"), main_before, "main unchanged after refusal");
+    }
+
+    #[test]
+    fn merge_refused_when_base_ref_is_not_a_branch() {
+        let repo = init_repo();
+        let rp = repo.path();
+        add_task_branch(rp, "sha1");
+        // Pass a raw SHA (a valid object, but not a local branch) as base_ref.
+        let sha = head_of(rp, "main");
+        let err = merge_task_branch(rp, &sha, "sha1").expect_err("SHA base_ref refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a local branch"), "got: {msg}");
+    }
+
+    #[test]
+    fn merge_errors_when_task_branch_missing() {
+        let repo = init_repo();
+        let err = merge_task_branch(repo.path(), "main", "absent").expect_err("missing branch");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing") || msg.contains("nothing to merge"), "got: {msg}");
     }
 }

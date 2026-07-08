@@ -30,6 +30,7 @@ CREATE TABLE tasks (
   containment_level  INTEGER NOT NULL,
   spec               TEXT NOT NULL,
   workspace          TEXT,
+  repo_path          TEXT,
   base_ref           TEXT NOT NULL,
   branch             TEXT NOT NULL,
   created_at         TEXT NOT NULL

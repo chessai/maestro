@@ -146,6 +146,7 @@ fn seed_task(j: &Journal) -> (String, String) {
             &spec,
             "main",
             Some("/tmp/wt"),
+            Some("/tmp/repo"),
             None,
         )
         .unwrap();
@@ -179,6 +180,25 @@ fn ac5_event_sourcing_derived_state() {
     assert_eq!(rows[0].model, "codex");
     assert_eq!(rows[0].containment, ContainmentLevel::L1);
     assert_eq!(rows[0].state, "verify_passed");
+}
+
+// repo_path persists on the task row and is read back by both `get_task` and
+// the focused `task_repo_and_base` accessor used by the advisor merge path.
+#[test]
+fn repo_path_and_base_ref_round_trip() {
+    let j = Journal::open_in_memory().unwrap();
+    let (_advisor, task) = seed_task(&j);
+
+    let full = j.get_task(&task).unwrap();
+    assert_eq!(full.repo_path.as_deref(), Some("/tmp/repo"));
+    assert_eq!(full.base_ref, "main");
+
+    let (repo_path, base_ref) = j.task_repo_and_base(&task).unwrap();
+    assert_eq!(repo_path.as_deref(), Some("/tmp/repo"));
+    assert_eq!(base_ref, "main");
+
+    // A missing task is a NotFound error, not a silent None.
+    assert!(j.task_repo_and_base("nonexistent").is_err());
 }
 
 // AC6: UNIQUE(task_id, seq) is enforced; event_chain returns seq order.

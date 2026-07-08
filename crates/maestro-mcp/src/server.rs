@@ -101,7 +101,7 @@ impl McpServer {
 
     /// `tools/list`: the M1 + M2 + M3 + ADR-005 advisor tools.
     fn tools_list() -> Value {
-        json!({ "tools": [ delegate_tool(), task_status_tool(), close_task_tool(), journal_query_tool(), kill_task_tool(), search_tool(), fetch_extract_tool() ] })
+        json!({ "tools": [ delegate_tool(), task_status_tool(), close_task_tool(), merge_task_tool(), journal_query_tool(), kill_task_tool(), search_tool(), fetch_extract_tool() ] })
     }
 
     /// `tools/call`: mint the advisor on first call, dispatch, then drain the
@@ -123,6 +123,7 @@ impl McpServer {
             "delegate" => self.call_delegate(&advisor_id, args),
             "task_status" => self.call_task_status(&advisor_id, args),
             "close_task" => self.call_close_task(&advisor_id, args),
+            "merge_task" => self.call_merge_task(&advisor_id, args),
             "journal_query" => self.call_journal_query(&advisor_id, args),
             "kill_task" => self.call_kill_task(args),
             "search" => self.call_search(&advisor_id, args),
@@ -228,6 +229,23 @@ impl McpServer {
             Ok(Response::Error { message }) => tool_error(message),
             Ok(other) => tool_error(format!("unexpected daemon response: {other:?}")),
             Err(e) => tool_error(format!("close_task failed: {e:#}")),
+        }
+    }
+
+    fn call_merge_task(&mut self, advisor_id: &str, args: &Value) -> Value {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(id) => id.to_string(),
+            None => return tool_error("merge_task: missing required `task_id` string".into()),
+        };
+        let req = Request::MergeTask {
+            advisor_session_id: advisor_id.to_string(),
+            task_id,
+        };
+        match self.transport.call(&req) {
+            Ok(Response::Merged { task_id }) => tool_text(format!("merged: {task_id}")),
+            Ok(Response::Error { message }) => tool_error(message),
+            Ok(other) => tool_error(format!("unexpected daemon response: {other:?}")),
+            Err(e) => tool_error(format!("merge_task failed: {e:#}")),
         }
     }
 
@@ -548,6 +566,28 @@ fn close_task_tool() -> Value {
                 "successor": {
                     "type": "string",
                     "description": "Optional id of the successor task (used when outcome is `superseded`)."
+                }
+            }
+        }
+    })
+}
+
+fn merge_task_tool() -> Value {
+    json!({
+        "name": "merge_task",
+        "description": "Fast-forward-merge a passed task's branch into its base ref. \
+            This is the ONLY way a task branch is merged — the daemon never merges \
+            on its own. The task must be in the `verify_passed` state (passed, \
+            committed, awaiting merge). The merge is fast-forward-only: if the base \
+            branch has advanced since the task branched, or `base_ref` is not a \
+            local branch, this returns an error and merges nothing.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["task_id"],
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "The id of the passed task to merge."
                 }
             }
         }

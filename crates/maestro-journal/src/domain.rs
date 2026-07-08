@@ -341,6 +341,11 @@ pub struct Task {
     pub spec: String,
     /// Worktree path.
     pub workspace: Option<String>,
+    /// The origin repository the worktree branched from (the `delegate`'s
+    /// `repo_path`). Needed to fast-forward-merge the task branch on an explicit
+    /// advisor `merge_task` (ADR-006). Nullable for rows created before this
+    /// field existed / rows delegated without a repo path.
+    pub repo_path: Option<String>,
     pub base_ref: String,
     /// `maestro/<task-ulid>`.
     pub branch: String,

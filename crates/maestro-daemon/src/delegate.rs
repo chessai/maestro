@@ -194,6 +194,7 @@ pub fn record_rejected_task(
                 "HEAD",
                 None,
                 None,
+                None,
             )
             .ok()?
     };
@@ -657,6 +658,7 @@ pub fn delegate(
                 &spec_json,
                 &base_ref,
                 None,
+                Some(repo_path),
                 None,
             )
             .map_err(|e| DelegateError::Internal(format!("create_task: {e}")))?

@@ -82,6 +82,16 @@ enum Command {
         #[arg(long)]
         successor: Option<String>,
     },
+    /// Fast-forward-merge a passed task's branch into its base ref (ADR-006).
+    /// The task must be in the `verify_passed` state; merge is fast-forward-only.
+    MergeTask {
+        /// Advisor session id.
+        #[arg(long)]
+        advisor: String,
+        /// Task id to merge (must be `verify_passed`).
+        #[arg(long)]
+        task: String,
+    },
     /// Run a named, read-only journal query and pretty-print its JSON result.
     JournalQuery {
         /// Advisor session id.
@@ -159,6 +169,7 @@ fn real_main() -> Result<()> {
             outcome,
             successor,
         } => cmd_close_task(profile, &advisor, &task, &outcome, successor.as_deref()),
+        Command::MergeTask { advisor, task } => cmd_merge_task(profile, &advisor, &task),
         Command::JournalQuery {
             advisor,
             query,
@@ -378,6 +389,27 @@ fn cmd_close_task(
         }
         Response::Error { message } => bail!("daemon error on close-task: {message}"),
         other => bail!("unexpected response to CloseTask: {other:?}"),
+    }
+}
+
+/// `maestro merge-task --advisor <id> --task <id>`: fast-forward-merge a passed
+/// task's branch into its base ref (ADR-006). Fast-forward-only; requires the
+/// task to be in the `verify_passed` state.
+fn cmd_merge_task(profile: Option<&str>, advisor: &str, task: &str) -> Result<()> {
+    let resp = ensured_request(
+        profile,
+        &Request::MergeTask {
+            advisor_session_id: advisor.to_string(),
+            task_id: task.to_string(),
+        },
+    )?;
+    match resp {
+        Response::Merged { task_id } => {
+            println!("merged task {task_id}");
+            Ok(())
+        }
+        Response::Error { message } => bail!("daemon error on merge-task: {message}"),
+        other => bail!("unexpected response to MergeTask: {other:?}"),
     }
 }
 

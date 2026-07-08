@@ -372,6 +372,10 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
             outcome,
             successor,
         } => close_task(state, &advisor_session_id, &task_id, &outcome, successor.as_deref()),
+        Request::MergeTask {
+            advisor_session_id,
+            task_id,
+        } => merge_task(state, &advisor_session_id, &task_id),
         Request::JournalQuery {
             advisor_session_id,
             query,
@@ -574,6 +578,97 @@ fn close_task(
         };
     }
     Response::Closed {
+        task_id: task_id.to_string(),
+    }
+}
+
+/// `MergeTask`: explicit, advisor-initiated fast-forward merge of a passed task's
+/// branch into its `base_ref` (ADR-006). This is NOT auto-merge — the daemon
+/// never merges on its own; this runs ONLY on this request and is gated on the
+/// task resting in `verify_passed` (passed, committed, awaiting merge). On a
+/// successful fast-forward it emits `merged`, removes the worktree, best-effort
+/// deletes the task branch, and replies `Merged`. A non-fast-forward / missing
+/// branch / non-branch base is an `Error` and NO `merged` event is written.
+fn merge_task(state: &SharedState, _advisor_session_id: &str, task_id: &str) -> Response {
+    use maestro_journal::domain::EventKind;
+
+    // Gate on the resting verify_passed state, then read (repo_path, base_ref),
+    // releasing the journal lock before shelling out to git (the merge does no
+    // journal I/O and we re-lock to record `merged`).
+    let (repo_path, base_ref) = {
+        let j = state.delegation.journal.lock().expect("journal mutex poisoned");
+        match j.current_state(task_id) {
+            Ok(Some(EventKind::VerifyPassed)) => {}
+            Ok(Some(EventKind::Merged)) => {
+                return Response::Error {
+                    message: format!("merge_task: task {task_id} is already merged"),
+                };
+            }
+            Ok(_) => {
+                return Response::Error {
+                    message: format!(
+                        "merge_task: task {task_id} is not in a merge-ready (verify_passed) state"
+                    ),
+                };
+            }
+            Err(e) => {
+                return Response::Error {
+                    message: format!("merge_task: {e}"),
+                };
+            }
+        }
+        match j.task_repo_and_base(task_id) {
+            Ok((Some(repo), base)) => (repo, base),
+            Ok((None, _)) => {
+                return Response::Error {
+                    message: format!(
+                        "merge_task: task {task_id} has no recorded repo path; merge manually"
+                    ),
+                };
+            }
+            Err(e) => {
+                return Response::Error {
+                    message: format!("merge_task: {e}"),
+                };
+            }
+        }
+    };
+
+    let repo = std::path::PathBuf::from(&repo_path);
+    let outcome = match worktree::merge_task_branch(&repo, &base_ref, task_id) {
+        Ok(o) => o,
+        Err(e) => {
+            // No `merged` event on failure.
+            return Response::Error {
+                message: format!("merge_task: {e:#}"),
+            };
+        }
+    };
+
+    // Record the terminal `merged` event.
+    let payload = serde_json::json!({
+        "base_ref": outcome.base_ref,
+        "branch": outcome.branch,
+        "merged_sha": outcome.merged_sha,
+    })
+    .to_string();
+    {
+        let j = state.delegation.journal.lock().expect("journal mutex poisoned");
+        if let Err(e) = j.append_event(task_id, EventKind::Merged, Some(&payload)) {
+            return Response::Error {
+                message: format!("merge_task: append merged failed: {e}"),
+            };
+        }
+    }
+
+    // Best-effort cleanup: detach the task's worktree (which still has the branch
+    // checked out) then delete the merged branch. The branch was merged (base_ref
+    // now contains it), so deletion is safe. The worktree lives at the
+    // conventional `<state_dir>/worktrees/<task_id>` path.
+    worktree::remove(&repo, &worktree::worktree_path(task_id));
+    worktree::delete_branch(&repo, task_id);
+
+    Response::Merged {
         task_id: task_id.to_string(),
     }
 }

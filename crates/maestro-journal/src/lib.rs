@@ -130,6 +130,7 @@ impl Journal {
         spec_json: &str,
         base_ref: &str,
         workspace: Option<&str>,
+        repo_path: Option<&str>,
         parent_task: Option<&str>,
     ) -> Result<String> {
         let id = new_ulid();
@@ -137,8 +138,8 @@ impl Journal {
         self.conn.execute(
             "INSERT INTO tasks
                (task_id, advisor_session_id, parent_task, depends_on, tier, model,
-                containment_level, spec, workspace, base_ref, branch, created_at)
-             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                containment_level, spec, workspace, repo_path, base_ref, branch, created_at)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 id,
                 advisor_session_id,
@@ -148,6 +149,7 @@ impl Journal {
                 containment_level.as_int(),
                 spec_json,
                 workspace,
+                repo_path,
                 base_ref,
                 branch,
                 now_iso8601(),
@@ -752,13 +754,29 @@ impl Journal {
         self.conn
             .query_row(
                 "SELECT task_id, advisor_session_id, parent_task, depends_on, tier, model,
-                        containment_level, spec, workspace, base_ref, branch, created_at
+                        containment_level, spec, workspace, repo_path, base_ref, branch, created_at
                  FROM tasks WHERE task_id = ?1",
                 [task_id],
                 Self::map_task_row,
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("task {task_id}")))?
+    }
+
+    /// The `(repo_path, base_ref)` for a task — the origin repository and the
+    /// ref the branch was cut from — used by the advisor `merge_task` path to
+    /// fast-forward `maestro/<task_id>` into its base (ADR-006). `repo_path` is
+    /// `None` for rows delegated without a repo path. Errors with `NotFound` if
+    /// the task does not exist.
+    pub fn task_repo_and_base(&self, task_id: &str) -> Result<(Option<String>, String)> {
+        self.conn
+            .query_row(
+                "SELECT repo_path, base_ref FROM tasks WHERE task_id = ?1",
+                [task_id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("task {task_id}")))
     }
 
     fn map_task_row(r: &rusqlite::Row) -> rusqlite::Result<Result<Task>> {
@@ -776,9 +794,10 @@ impl Journal {
                     .map_err(Error::InvalidData)?,
                 spec: r.get(7)?,
                 workspace: r.get(8)?,
-                base_ref: r.get(9)?,
-                branch: r.get(10)?,
-                created_at: r.get(11)?,
+                repo_path: r.get(9)?,
+                base_ref: r.get(10)?,
+                branch: r.get(11)?,
+                created_at: r.get(12)?,
             })
         })())
     }
@@ -918,7 +937,7 @@ mod m6_tests {
 
     fn task(j: &Journal, adv: &str, tier: Tier, model: &str) -> String {
         let spec = serde_json::json!({ "title": "t" }).to_string();
-        j.create_task(adv, tier, model, ContainmentLevel::L0, &spec, "HEAD", None, None)
+        j.create_task(adv, tier, model, ContainmentLevel::L0, &spec, "HEAD", None, None, None)
             .unwrap()
     }
 

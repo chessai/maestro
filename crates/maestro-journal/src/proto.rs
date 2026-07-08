@@ -53,6 +53,18 @@ pub enum Request {
         outcome: String,
         successor: Option<String>,
     },
+    /// Advisor `merge_task(task_id)` — explicit, advisor-initiated fast-forward
+    /// merge of a passed task's branch `maestro/<task_id>` into its `base_ref`
+    /// (ADR-006). This is NOT auto-merge: the daemon never merges on its own;
+    /// merge happens ONLY on this request and is gated on the task being in the
+    /// resting `verify_passed` (passed, committed, awaiting merge) state. On a
+    /// successful fast-forward the daemon emits `merged` and replies
+    /// [`Response::Merged`]; a non-fast-forward / missing branch / non-branch
+    /// base is a [`Response::Error`] and no `merged` event is written.
+    MergeTask {
+        advisor_session_id: String,
+        task_id: String,
+    },
     /// A named, read-only journal query (ADR-001 telemetry). `query` selects a
     /// canned query (e.g. `verifier_reports`, `trace`); `params` carries its
     /// arguments (e.g. `{ "task_id": "…" }`).
@@ -108,6 +120,9 @@ pub enum Response {
     Inbox { items: Vec<InboxItem> },
     /// Reply to [`Request::CloseTask`]: the closed task's id.
     Closed { task_id: String },
+    /// Reply to [`Request::MergeTask`]: the task's branch was fast-forward-merged
+    /// into its `base_ref` and a `merged` event was recorded.
+    Merged { task_id: String },
     /// Reply to [`Request::JournalQuery`]: the query's JSON result.
     JournalResult { value: serde_json::Value },
     /// Reply to [`Request::KillTask`]: the kill request was delivered to the
