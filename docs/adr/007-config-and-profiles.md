@@ -65,7 +65,6 @@ downgrade_policy = "tighten"
 
 The following config knobs are defined in the schema but **not yet wired or enforced** in v1; they are parsed and journaled but have no runtime effect:
 
-
 - **`tighten.turn_factor` enforcement**: the turn factor is computed and journaled on containment downgrade but is **not** yet applied as a hard stop — there is no driver turn-accounting to enforce a per-attempt turn cap mid-session, so the tightened turn budget is recorded-only pending that mechanism. (`tighten.allowlist_factor` and `codex_tighten` ARE enforced — see below.)
 - **`credentials.toml` keychain/agenix backends**: the 0600 `[env]`-table file is loaded at daemon startup (permission-gated; environment always wins over the file), but the pluggable keychain/agenix trait backends are not yet built.
 - **supervision-freedom multiplier from `advisor.context`**: the implied tightening from `advisor.context = "standard"` is not yet wired (only containment downgrade and `codex_tighten` activate tightening).
