@@ -19,7 +19,7 @@ The probe also **auth-checks each configured role model** (ADR-007) and surfaces
 | level | composition |
 |---|---|
 | L0 | agent-native sandbox + universal post-hoc enforcement (below). Available everywhere. |
-| L1 | L0 + OS sandbox wrapper (pluggable backend, see below): workspace-only writes, private tmp, network default-deny with per-task allowlist |
+| L1 | L0 + OS sandbox wrapper (pluggable backend, see below): workspace-only writes, private tmp (with `TMPDIR` normalized to the in-sandbox `/tmp` so tools that honor it — e.g. `rustdoc` — don't chase an orphaned host temp path), network default-deny with per-task allowlist |
 | L2 | L1 + Nix devShell tool whitelist: session PATH contains only the spec-declared toolchain; devShell variant selected per task |
 
 **Universal post-hoc enforcement (all levels, fully portable):** out-of-scope diff rejection against the file allowlist, turn/token budgets, PTY watchdog, and daemon-held credentials (below). These do not depend on host capabilities and are the floor everything stands on.

@@ -462,6 +462,19 @@ fn wrap_bwrap(
         // --bind re-exposes it rather than being shadowed by the tmpfs.
         "--tmpfs".to_string(),
         "/tmp".to_string(),
+        // Normalize TMPDIR to the sandbox's own writable /tmp. Without this,
+        // a nix devshell sets TMPDIR=/tmp/nix-shell.XXXX in the parent env;
+        // the fresh tmpfs above shadows that host path, making it non-existent
+        // inside the sandbox. Tools that honor TMPDIR (e.g. rustdoc) then fail
+        // to create temp dirs. bwrap preserves the parent env by default (no
+        // --clearenv — required at L2 so the devShell PATH whitelist survives),
+        // so we must explicitly override TMPDIR to point at the sandbox /tmp.
+        // Note: podman gets a fresh container fs and does not inherit the
+        // daemon's env (no --env-host), and seatbelt does not mount a tmpfs
+        // over /tmp, so TMPDIR normalization is bwrap-specific.
+        "--setenv".to_string(),
+        "TMPDIR".to_string(),
+        "/tmp".to_string(),
         // Only the workspace is writable.
         "--bind".to_string(),
         ws.clone(),
@@ -1172,6 +1185,57 @@ mod tests {
         let w = wrap(&sp, "cargo", &s(&["test"])).unwrap();
         assert_eq!(w.program, "bwrap");
         assert!(!w.args.contains(&"--unshare-net".to_string()));
+    }
+
+    // TMPDIR normalization: bwrap must include --setenv TMPDIR /tmp immediately
+    // after --tmpfs /tmp so that the sandbox's own writable /tmp is what tools
+    // see, rather than the inherited nix devshell TMPDIR (e.g.
+    // /tmp/nix-shell.XXXX) which does not exist under the fresh tmpfs.
+    #[test]
+    fn test_bwrap_setenv_tmpdir_present() {
+        let sp = spec(Level::L1, Backend::Bwrap, NetworkPolicy::Deny);
+        let w = wrap(&sp, "cargo", &s(&["test"])).unwrap();
+        assert_eq!(w.program, "bwrap");
+        // --setenv TMPDIR /tmp must appear as a contiguous sequence.
+        assert!(
+            contains_subseq(&w.args, &["--setenv", "TMPDIR", "/tmp"]),
+            "--setenv TMPDIR /tmp must be present in bwrap argv to normalize \
+             TMPDIR to the sandbox's own writable /tmp; got: {:?}",
+            w.args
+        );
+        // It must appear AFTER --tmpfs /tmp (sanity-check ordering).
+        let tmpfs_idx = w
+            .args
+            .windows(2)
+            .position(|pair| pair[0] == "--tmpfs" && pair[1] == "/tmp")
+            .expect("--tmpfs /tmp must be present");
+        let setenv_idx = w
+            .args
+            .windows(3)
+            .position(|triple| {
+                triple[0] == "--setenv" && triple[1] == "TMPDIR" && triple[2] == "/tmp"
+            })
+            .expect("--setenv TMPDIR /tmp must be present");
+        assert!(
+            tmpfs_idx < setenv_idx,
+            "--setenv TMPDIR /tmp (at {setenv_idx}) must come after \
+             --tmpfs /tmp (at {tmpfs_idx})"
+        );
+    }
+
+    // TMPDIR normalization applies at L2 as well (bwrap is the inner backend).
+    #[test]
+    fn test_bwrap_setenv_tmpdir_present_at_l2() {
+        let mut sp = spec(Level::L2, Backend::Bwrap, NetworkPolicy::Deny);
+        sp.flake_dir = Some(PathBuf::from("/f"));
+        let w = wrap(&sp, "cargo", &s(&["test"])).unwrap();
+        assert_eq!(w.program, "nix");
+        assert!(
+            contains_subseq(&w.args, &["--setenv", "TMPDIR", "/tmp"]),
+            "--setenv TMPDIR /tmp must appear in the inner bwrap args at L2; \
+             got: {:?}",
+            w.args
+        );
     }
 
     // AC6: L2 = nix develop OUTSIDE, bwrap (absolute path) INSIDE.
