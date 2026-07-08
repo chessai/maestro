@@ -12,9 +12,15 @@
 //!
 //! - **Phase 1 (plan):** `<program> <args...> --output-format stream-json
 //!   --verbose --permission-mode plan <prompt>` — claude produces a plan and
-//!   edits nothing. The plan text is the concatenation of the FIRST assistant
-//!   event's `content[].text` blocks. The [`PlanChecker`] runs on it. Reject ⇒
-//!   [`EndReason::PlanRejected`] with ZERO edits (nothing that could edit ran).
+//!   edits nothing. This phase is AGENTIC: claude emits many assistant turns
+//!   (thinking, then `tool_use` for Read/Glob/Bash/etc.) BEFORE its plan text
+//!   arrives in a later turn, and often submits the final plan via an
+//!   `ExitPlanMode` tool call. So the plan text is the model's plan accumulated
+//!   across the WHOLE plan phase: the `ExitPlanMode`-submitted plan when present,
+//!   else the concatenation of every assistant event's `content[].text` blocks
+//!   (NOT just the first assistant event, which is typically empty). The
+//!   [`PlanChecker`] runs on it. Reject ⇒ [`EndReason::PlanRejected`] with ZERO
+//!   edits (nothing that could edit ran).
 //! - **Phase 2 (execute):** only if accepted:
 //!   `<program> <args...> --output-format stream-json --verbose
 //!   --permission-mode acceptEdits <prompt>` — claude makes the edits in the
@@ -99,7 +105,10 @@ enum JsonPhaseKind {
 /// The terminal kind + captured plan text + metering for one stream-json phase.
 struct JsonPhaseOutcome {
     kind: JsonPhaseKind,
-    /// Concatenated `content[].text` of the FIRST assistant event (the plan).
+    /// The model's plan accumulated across the plan phase: the
+    /// `ExitPlanMode`-submitted plan when present, else all assistant text
+    /// concatenated (NOT just the first assistant event). Only meaningful for
+    /// phase 1; the execute phase ignores it.
     plan_text: String,
     metering: PhaseMetering,
 }
@@ -176,8 +185,9 @@ pub fn run_claude_driven(
             }
         }
 
-        // The plan text = the FIRST assistant event's text (empty if none; the
-        // checker decides what an empty plan means).
+        // The plan text = the model's plan accumulated across the plan phase
+        // (ExitPlanMode submission if present, else all assistant text; empty if
+        // none — the checker decides what an empty plan means).
         let plan = plan_out.plan_text;
         match checker.check(&plan, &spec) {
             PlanVerdict::Reject { reason } => {
@@ -384,10 +394,11 @@ fn run_json_phase(
     };
 
     // `pty` drops here: reader joined, master/writer closed.
+    let metering = state.metering.clone();
     JsonPhaseOutcome {
         kind,
-        plan_text: state.plan_text,
-        metering: state.metering,
+        plan_text: state.plan(),
+        metering,
     }
 }
 
@@ -395,11 +406,26 @@ fn run_json_phase(
 #[derive(Default)]
 struct ParseState {
     metering: PhaseMetering,
-    /// Text of the first assistant event; captured once.
-    plan_text: String,
-    /// Whether the first assistant event has been seen (so we capture the plan
-    /// exactly once).
-    saw_first_assistant: bool,
+    /// The `text` blocks of EVERY assistant event, concatenated with "\n"
+    /// separators so multiple agentic turns' text stays readable. This is the
+    /// fallback plan text when no explicit `ExitPlanMode` submission arrives.
+    all_text: String,
+    /// The plan submitted via an `ExitPlanMode` tool call, if any (last one
+    /// wins). When non-empty this takes precedence over `all_text`.
+    exit_plan: String,
+}
+
+impl ParseState {
+    /// The effective plan text for this phase: the `ExitPlanMode`-submitted plan
+    /// when present, else all accumulated assistant text. Only meaningful for
+    /// the plan phase; the execute phase ignores it.
+    fn plan(self) -> String {
+        if self.exit_plan.is_empty() {
+            self.all_text
+        } else {
+            self.exit_plan
+        }
+    }
 }
 
 /// Parse every NEW newline-terminated line in the shared buffer past `cursor`,
@@ -434,9 +460,19 @@ fn fold_event(value: &serde_json::Value, state: &mut ParseState) {
     match value.get("type").and_then(|t| t.as_str()) {
         Some("assistant") => {
             state.metering.assistant_turns += 1;
-            if !state.saw_first_assistant {
-                state.saw_first_assistant = true;
-                state.plan_text = assistant_text(value);
+            // Accumulate this turn's plain text (empty for thinking-only or
+            // tool_use-only turns), separating turns with a newline so the plan
+            // stays readable across the agentic plan phase.
+            let text = assistant_text(value);
+            if !text.is_empty() {
+                if !state.all_text.is_empty() {
+                    state.all_text.push('\n');
+                }
+                state.all_text.push_str(&text);
+            }
+            // Prefer an explicit ExitPlanMode submission when present (last wins).
+            if let Some(plan) = exit_plan_from_assistant(value) {
+                state.exit_plan = plan;
             }
         }
         Some("result") => {
@@ -479,6 +515,35 @@ fn assistant_text(value: &serde_json::Value) -> String {
         }
     }
     out
+}
+
+/// Extract the plan submitted via an `ExitPlanMode` tool call in an `assistant`
+/// event, if any. Scans `message.content[]` for a `tool_use` block whose `name`
+/// is `ExitPlanMode` / `exit_plan_mode` (either casing) and returns its
+/// `input.plan` string. Returns `None` when there is no such block or no plan.
+fn exit_plan_from_assistant(value: &serde_json::Value) -> Option<String> {
+    let content = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())?;
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+            continue;
+        }
+        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if !name.eq_ignore_ascii_case("ExitPlanMode") && !name.eq_ignore_ascii_case("exit_plan_mode")
+        {
+            continue;
+        }
+        if let Some(plan) = block
+            .get("input")
+            .and_then(|i| i.get("plan"))
+            .and_then(|p| p.as_str())
+        {
+            return Some(plan.to_string());
+        }
+    }
+    None
 }
 
 /// Best-effort exit code from a portable-pty exit status (mirrors `pty.rs`).

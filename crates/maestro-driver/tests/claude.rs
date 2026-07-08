@@ -23,8 +23,12 @@ use tempfile::TempDir;
 ///
 /// It emulates claude's two permission modes by scanning ITS OWN args (the
 /// adapter appends `--permission-mode <mode>` and the prompt) and emits canned
-/// stream-json. The `plan` mode emits `system` init, ONE `assistant` with the
-/// plan text, and a `result` (11 in / 7 out / $0.01), editing NOTHING. The
+/// stream-json. The `plan` mode emits `system` init then, per the scenario,
+/// either ONE `assistant` with the plan text (default / reject), an AGENTIC
+/// sequence (`agentic`: a thinking-only turn, a tool_use-only turn, THEN the
+/// plan text), or an `ExitPlanMode` submission (`exitplan`: exploration turns
+/// then a tool_use carrying `input.plan`); it edits NOTHING and reports metering
+/// (11 in / 7 out / $0.01). The
 /// `acceptEdits` mode, per the scenario (`$1`), normally emits `system` + one
 /// assistant + a write of `$TARGET` + a metered `result`; special scenarios
 /// drive the turn-cap and kill/watchdog paths.
@@ -54,6 +58,20 @@ emit_init() {
 emit_assistant() {
   printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"%s"}]}}\n' "$1"
 }
+# An assistant turn carrying ONLY a thinking block (no text) — as the agentic
+# plan phase emits before it has any plan text.
+emit_thinking() {
+  printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"thinking","thinking":"let me explore"}]}}\n'
+}
+# An assistant turn carrying ONLY a tool_use block (no text). $1 = tool name.
+emit_tool_use() {
+  printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"tool_use","id":"t1","name":"%s","input":{"file_path":"x"}}]}}\n' "$1"
+}
+# An assistant turn submitting the plan via an ExitPlanMode tool_use (no text).
+# $1 = tool name (ExitPlanMode / exit_plan_mode), $2 = plan text.
+emit_exit_plan() {
+  printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"tool_use","id":"t2","name":"%s","input":{"plan":"%s"}}]}}\n' "$1" "$2"
+}
 # $1 in, $2 out, $3 cost, $4 num_turns.
 emit_result() {
   printf '{"type":"result","num_turns":%s,"total_cost_usd":%s,"usage":{"input_tokens":%s,"output_tokens":%s}}\n' "$4" "$3" "$1" "$2"
@@ -63,10 +81,32 @@ case "${mode}" in
   plan)
     emit_init
     case "${SCENARIO}" in
-      *reject*) emit_assistant "PLAN: I will delete everything and rewrite files" ;;
-      *)        emit_assistant "PLAN: I will create the file as specified" ;;
+      *reject*)
+        emit_assistant "PLAN: I will delete everything and rewrite files"
+        emit_result 11 7 0.01 1
+        ;;
+      agentic)
+        # AGENTIC plan phase: a thinking-only turn, then a tool_use-only turn
+        # (NO text in either), THEN the real plan text in a LATER turn. The
+        # first-assistant-only capture would extract an empty plan here.
+        emit_thinking
+        emit_tool_use "Read"
+        emit_assistant "PLAN: I will create the file as specified"
+        emit_result 11 7 0.01 3
+        ;;
+      exitplan)
+        # Exploration turns with NO plain-text plan, then the plan submitted via
+        # an ExitPlanMode tool_use. The adapter must use input.plan.
+        emit_thinking
+        emit_tool_use "Glob"
+        emit_exit_plan "ExitPlanMode" "PLAN: create the target file as specified"
+        emit_result 11 7 0.01 3
+        ;;
+      *)
+        emit_assistant "PLAN: I will create the file as specified"
+        emit_result 11 7 0.01 1
+        ;;
     esac
-    emit_result 11 7 0.01 1
     exit 0
     ;;
   acceptEdits)
@@ -195,8 +235,8 @@ fn config(f: &Fixture, scenario: &str, watchdog: Duration, turn_cap: Option<u32>
     }
 }
 
-/// Plan phase parses the FIRST assistant event's text; MockPlanChecker accepts
-/// (plan mentions "create") → phase 2 runs and writes the target → Completed.
+/// Plan phase accumulates the assistant text (here a single "create" turn);
+/// MockPlanChecker accepts → phase 2 runs and writes the target → Completed.
 /// Metering from the final `result` is surfaced on the DrivenResult.
 #[test]
 fn accept_runs_phase_two_and_writes_target_metered() {
@@ -226,6 +266,56 @@ fn accept_runs_phase_two_and_writes_target_metered() {
     // The stream-json was captured to the log (phase 1 + phase 2 stdout).
     let log = std::fs::read_to_string(&f.log).unwrap();
     assert!(log.contains("\"type\":\"assistant\""), "log: {log:?}");
+}
+
+/// REGRESSION: an AGENTIC plan phase whose FIRST assistant events carry no text
+/// (a thinking-only turn, then a tool_use-only turn) and whose real plan text
+/// arrives in a LATER assistant turn. The old first-assistant-only capture
+/// extracted an empty plan → `plan_rejected`. Now the plan is accumulated across
+/// the whole phase, so the "create" plan is found, accepted, and phase 2 runs.
+#[test]
+fn agentic_plan_phase_accumulates_text_and_accepts() {
+    let f = fixture();
+    let cfg = config(&f, "agentic", Duration::from_secs(15), None);
+    let (_handle, join) = run_claude_driven(cfg, spec(), Arc::new(MockPlanChecker)).unwrap();
+    let result = join.join().unwrap();
+
+    // KEY: the empty-first-assistant plan phase still yields a non-empty plan
+    // that MockPlanChecker accepts → phase 2 runs to completion (NOT rejected).
+    assert_eq!(
+        result.reason,
+        EndReason::Completed,
+        "agentic plan (empty first turns) must still extract the later plan text \
+         and proceed to phase 2; log at {:?}",
+        f.log
+    );
+    assert!(
+        f.target.is_file(),
+        "phase 2 should have run and written the target"
+    );
+}
+
+/// The plan phase submits its plan via an `ExitPlanMode` tool_use (with NO plain
+/// text plan in any turn). The adapter must read `input.plan` from that call,
+/// so MockPlanChecker sees a "create" plan and phase 2 runs.
+#[test]
+fn exit_plan_mode_submission_is_used_as_plan() {
+    let f = fixture();
+    let cfg = config(&f, "exitplan", Duration::from_secs(15), None);
+    let (_handle, join) = run_claude_driven(cfg, spec(), Arc::new(MockPlanChecker)).unwrap();
+    let result = join.join().unwrap();
+
+    assert_eq!(
+        result.reason,
+        EndReason::Completed,
+        "ExitPlanMode-submitted plan must be used as the plan text and accepted; \
+         log at {:?}",
+        f.log
+    );
+    assert!(
+        f.target.is_file(),
+        "phase 2 should have run and written the target"
+    );
 }
 
 /// A single-phase metering assertion: the plan phase alone reports
