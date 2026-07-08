@@ -318,6 +318,40 @@ roles.verifier_floor = "mock"
         other => panic!("expected Error on re-merge, got {other:?}"),
     }
 
+    // ---- FIX 1: a spec with base_ref="HEAD" resolves to the current branch ----
+    // Re-checkout `main` (it was previously detached) so HEAD is symbolic → the
+    // delegate-time `resolve_base_ref` turns "HEAD" into the branch name "main",
+    // which is what gets persisted AND what `merge_task` needs to fast-forward.
+    git(&repo, &["checkout", "-q", "main"]);
+    let main_before = rev(&repo, "main");
+    let head_task = delegate(&socket, &advisor, &repo_path, spec("HEAD", "src/head.rs", true));
+    let head_state = poll_terminal(&socket, &advisor, &head_task, Duration::from_secs(30));
+    assert_eq!(head_state, "verify_passed", "HEAD base_ref task passes");
+    // The task row persisted the RESOLVED base_ref ("main"), not "HEAD".
+    {
+        let db_path = maestro_journal::paths::journal_db_path();
+        let journal =
+            maestro_journal::Journal::open(db_path.to_str().unwrap()).expect("open journal");
+        let (_repo, stored_base) = journal.task_repo_and_base(&head_task).unwrap();
+        assert_eq!(stored_base, "main", "base_ref 'HEAD' resolved+stored as 'main'");
+    }
+    let head_tip = rev(&repo, &format!("maestro/{head_task}"));
+    // merge_task fast-forwards `main` to the task tip — impossible if "HEAD" had
+    // been stored raw (it is not a local branch).
+    let head_merged = round_trip(
+        &socket,
+        &Request::MergeTask {
+            advisor_session_id: advisor.clone(),
+            task_id: head_task.clone(),
+        },
+    );
+    match head_merged {
+        Response::Merged { task_id } => assert_eq!(task_id, head_task),
+        other => panic!("expected Merged for HEAD-based task, got {other:?}"),
+    }
+    assert_ne!(head_tip, main_before, "task added a commit");
+    assert_eq!(rev(&repo, "main"), head_tip, "main advanced to the HEAD-based task tip");
+
     shutdown.store(true, Ordering::SeqCst);
     handle.join().expect("server thread joins");
     let _ = std::fs::remove_dir_all(&tmp);

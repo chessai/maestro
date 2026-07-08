@@ -758,7 +758,14 @@ pub fn delegate(
 
     let spec_json = serde_json::to_string(&spec)
         .map_err(|e| DelegateError::Internal(format!("serializing spec: {e}")))?;
-    let base_ref = spec.base_ref.clone();
+    // Resolve a possibly-symbolic base_ref (e.g. "HEAD") to a concrete local
+    // branch UP FRONT, so the natural spec value "just works" end-to-end: the
+    // task branches off it AND `merge_task` can later fast-forward it (which
+    // requires a local branch). The RESOLVED value is persisted in the task row
+    // + used throughout the pipeline; `spec.base_ref` in the stored spec JSON is
+    // left as-is (the spec is immutable). A SHA/tag/detached HEAD resolves to
+    // itself (branching off it is valid; it is simply not merge_task-able).
+    let base_ref = worktree::resolve_base_ref(&repo, &spec.base_ref);
 
     // The workspace path is fixed by convention: <state>/worktrees/<task_id>.
     // We do not know the task_id until create_task mints it, so record the row
@@ -1804,11 +1811,17 @@ fn run_gate_and_verify(
             let diff = worktree::diff(worktree_path, base_ref).unwrap_or_default();
             Ok(AttemptOutcome::VerificationFailed { diff, report: None })
         }
-        GateOutcome::Passed => {
+        GateOutcome::Passed { changed } => {
             emit(state, task_id, EventKind::ChecksPassed, None);
             // --- model verifier (ADR-002) -------------------------------
             let gate_output = "mechanical gate: allowlist ok; check commands ok".to_string();
-            let diff = worktree::diff(worktree_path, base_ref)
+            // Restrict the verifier's structural input to the implementer's
+            // in-allowlist changed files, captured at the scope-check step BEFORE
+            // the check commands ran (ADR-002). This keeps post-build artifacts
+            // (e.g. `target/`) that a check command created out of the diff even
+            // when the repo has no `.gitignore` — a plain `add -A` diff would
+            // otherwise stage them.
+            let diff = worktree::diff_paths(worktree_path, base_ref, &changed)
                 .map_err(|e| fail("internal_error", format!("diff for verifier: {e}")))?;
 
             let report = run_verifier(
@@ -1827,10 +1840,21 @@ fn run_gate_and_verify(
 
             match report.verdict {
                 Verdict::Pass => {
+                    // Commit ONLY the implementer's in-allowlist changed files;
+                    // leave for human merge — NEVER auto-merge. Restricting to the
+                    // gate's pre-build `changed` set keeps build artifacts (e.g.
+                    // `target/`) that a check command created out of the committed
+                    // branch, even without a `.gitignore`. Commit BEFORE emitting
+                    // `verify_passed` so an observer that sees that terminal state
+                    // (and may immediately `merge_task`) always finds the branch
+                    // already committed — no observe-before-commit race.
+                    worktree::commit_paths(
+                        worktree_path,
+                        &changed,
+                        &format!("maestro: {}", spec.title),
+                    )
+                    .map_err(|e| fail("internal_error", format!("commit: {e}")))?;
                     emit(state, task_id, EventKind::VerifyPassed, None);
-                    // Commit the branch; leave for human merge — NEVER auto-merge.
-                    worktree::commit_all(worktree_path, &format!("maestro: {}", spec.title))
-                        .map_err(|e| fail("internal_error", format!("commit: {e}")))?;
                     Ok(AttemptOutcome::Passed)
                 }
                 Verdict::Fail => {

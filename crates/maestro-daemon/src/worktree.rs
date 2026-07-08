@@ -50,6 +50,49 @@ fn git(args: &[&str]) -> Result<String> {
     Ok(stdout.into_owned())
 }
 
+/// Resolve a possibly-symbolic `base_ref` to a concrete, mergeable branch name.
+///
+/// The delegation pipeline branches every task off `base_ref` and `merge_task`
+/// later fast-forwards that same `base_ref` — which requires it to name a LOCAL
+/// branch. A natural spec value like `"HEAD"` is symbolic: it branches fine but
+/// cannot be advanced. This resolves such symbolic refs to the current branch's
+/// short name UP FRONT so `"HEAD"` "just works" end-to-end.
+///
+/// Rules (best-effort; any git error → `base_ref` unchanged, never panics):
+/// - `base_ref` already names a local branch (`refs/heads/<base_ref>` verifies)
+///   → return it unchanged.
+/// - `base_ref == "HEAD"`, OR `HEAD` is a symbolic ref and `base_ref` names the
+///   current branch → resolve to the current branch short name and return that.
+/// - Otherwise (a raw SHA, a tag, or detached HEAD) → return `base_ref`
+///   UNCHANGED. Branching off a SHA/tag is valid advanced usage; it simply is
+///   not `merge_task`-able, and `merge_task` already gives a clear error there.
+pub fn resolve_base_ref(repo: &Path, base_ref: &str) -> String {
+    let Some(repo) = repo.to_str() else {
+        return base_ref.to_string();
+    };
+
+    // Already a local branch → mergeable as-is.
+    if git_ok(
+        repo,
+        &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{base_ref}")],
+    ) {
+        return base_ref.to_string();
+    }
+
+    // Symbolic ref resolving to the current branch. `symbolic-ref --quiet HEAD`
+    // succeeds only when HEAD points at a branch (not detached). We resolve when
+    // the caller asked for "HEAD" itself, or named the current branch explicitly.
+    let current_branch = git_c(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    if let Some(branch) = current_branch {
+        if base_ref == "HEAD" || base_ref == branch {
+            return branch;
+        }
+    }
+
+    // A raw SHA / tag / detached HEAD: leave unchanged (valid, just not mergeable).
+    base_ref.to_string()
+}
+
 /// Create a worktree for `task_id` off `base_ref`, on a fresh branch
 /// `maestro/<task_id>`. Returns the worktree path.
 pub fn create(repo_path: &Path, base_ref: &str, task_id: &str) -> Result<PathBuf> {
@@ -125,6 +168,77 @@ pub fn diff(worktree: &Path, base_ref: &str) -> Result<String> {
     let wt = worktree.to_str().context("worktree path is not valid UTF-8")?;
     git(&["-C", wt, "add", "-A"])?;
     git(&["-C", wt, "diff", "--cached", base_ref])
+}
+
+/// The unified diff of ONLY `paths` vs `base_ref` (staged + new). Runs
+/// `git add -A` first so untracked writes are staged, then
+/// `git diff --cached <base_ref> -- <paths...>` with each path as a LITERAL
+/// pathspec. Unlike [`diff`], this restricts the diff to an exact file set — the
+/// gate's already-globset-filtered in-allowlist changed files — so post-build
+/// artifacts (e.g. `target/`) staged by `add -A` after the gate ran its check
+/// commands never leak into the verifier's structural input. An empty `paths`
+/// slice yields an empty diff (no `git` invocation).
+pub fn diff_paths(worktree: &Path, base_ref: &str, paths: &[String]) -> Result<String> {
+    if paths.is_empty() {
+        return Ok(String::new());
+    }
+    let wt = worktree.to_str().context("worktree path is not valid UTF-8")?;
+    git(&["-C", wt, "add", "-A"])?;
+    let mut args: Vec<&str> = vec!["-C", wt, "diff", "--cached", base_ref, "--"];
+    for p in paths {
+        args.push(p.as_str());
+    }
+    git(&args)
+}
+
+/// Commit with `message` ONLY the changes to `paths`, iff there is something to
+/// commit for them (mirrors [`commit_all`]'s "nothing staged → `Ok(false)`"
+/// guard). Restricting to the gate's in-allowlist changed files makes the
+/// committed task branch immune to post-build artifacts (e.g. `target/`) even
+/// when the repo has no `.gitignore`. An empty `paths` slice commits nothing →
+/// `Ok(false)`. Paths are EXACT files (not globs), so there is no
+/// git-pathspec/globset mismatch.
+///
+/// The index is reset to the current commit FIRST, so any earlier `git add -A`
+/// (e.g. from a preceding [`diff_paths`] call, which stages everything to build
+/// the verifier diff) cannot leak already-staged out-of-allowlist paths into the
+/// commit — only `paths` are staged, then committed with an explicit pathspec.
+pub fn commit_paths(worktree: &Path, paths: &[String], message: &str) -> Result<bool> {
+    let wt = worktree.to_str().context("worktree path is not valid UTF-8")?;
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    // Reset the index to HEAD so a prior `add -A` (from diff_paths) does not leave
+    // out-of-allowlist paths staged; then stage ONLY the given paths.
+    git(&["-C", wt, "reset", "-q"])?;
+    let mut add_args: Vec<&str> = vec!["-C", wt, "add", "--"];
+    for p in paths {
+        add_args.push(p.as_str());
+    }
+    git(&add_args)?;
+    // `git diff --cached --quiet -- <paths>` exits 1 when something is staged for
+    // those paths. Check on the restricted pathspec so we do not commit unrelated
+    // staged changes even if the reset were partial.
+    let mut quiet_args: Vec<&str> = vec!["-C", wt, "diff", "--cached", "--quiet", "--"];
+    for p in paths {
+        quiet_args.push(p.as_str());
+    }
+    let anything_staged = !Command::new("git")
+        .args(&quiet_args)
+        .status()
+        .with_context(|| "spawning `git diff --cached --quiet`")?
+        .success();
+    if !anything_staged {
+        return Ok(false);
+    }
+    // Commit with an explicit pathspec so ONLY the given paths are recorded, even
+    // if something else were somehow staged.
+    let mut commit_args: Vec<&str> = vec!["-C", wt, "commit", "-m", message, "--"];
+    for p in paths {
+        commit_args.push(p.as_str());
+    }
+    git(&commit_args)?;
+    Ok(true)
 }
 
 /// A best-effort partial-diff snapshot of a driven session's worktree, for
@@ -318,6 +432,49 @@ mod tests {
         assert!(!commit_all(wt.path(), "noop").unwrap(), "clean tree = no commit");
         std::fs::write(wt.path().join("a.txt"), "1\n").unwrap();
         assert!(commit_all(wt.path(), "add a").unwrap(), "dirty tree = commit");
+        remove(repo.path(), wt.path());
+    }
+
+    #[test]
+    fn resolve_base_ref_symbolic_and_concrete() {
+        let repo = init_repo();
+        let rp = repo.path();
+        // "HEAD" resolves to the current branch (`main`).
+        assert_eq!(resolve_base_ref(rp, "HEAD"), "main", "HEAD → current branch");
+        // An existing branch name is returned unchanged.
+        assert_eq!(resolve_base_ref(rp, "main"), "main", "existing branch unchanged");
+        // A raw commit SHA (valid object, not a branch) is returned unchanged.
+        let sha = head_of(rp, "main");
+        assert_eq!(resolve_base_ref(rp, &sha), sha, "SHA unchanged");
+        // A bogus ref is returned unchanged (never panics).
+        assert_eq!(resolve_base_ref(rp, "no-such-ref"), "no-such-ref", "bogus unchanged");
+    }
+
+    #[test]
+    fn commit_and_diff_paths_restrict_to_given_files() {
+        let repo = init_repo();
+        let wt = TempDir::new().unwrap();
+        let rp = repo.path().to_str().unwrap();
+        let wtp = wt.path().to_str().unwrap();
+        git(&["-C", rp, "worktree", "add", wtp, "-b", "maestro/p", "HEAD"]).unwrap();
+        // An in-allowlist file plus a stray (out-of-allowlist) file.
+        std::fs::write(wt.path().join("allowed.rs"), "//\n").unwrap();
+        std::fs::write(wt.path().join("stray.txt"), "x\n").unwrap();
+
+        // diff_paths shows ONLY the allowlisted file.
+        let d = diff_paths(wt.path(), "HEAD", &["allowed.rs".to_string()]).unwrap();
+        assert!(d.contains("allowed.rs"), "diff includes allowed.rs");
+        assert!(!d.contains("stray.txt"), "diff excludes stray.txt");
+        // Empty paths → empty diff.
+        assert!(diff_paths(wt.path(), "HEAD", &[]).unwrap().is_empty());
+
+        // commit_paths commits ONLY the allowlisted file.
+        assert!(commit_paths(wt.path(), &["allowed.rs".to_string()], "add allowed").unwrap());
+        let files = git(&["-C", wtp, "show", "--name-only", "--pretty=format:", "HEAD"]).unwrap();
+        assert!(files.contains("allowed.rs"), "committed allowed.rs, got: {files}");
+        assert!(!files.contains("stray.txt"), "did NOT commit stray.txt, got: {files}");
+        // Empty paths → nothing staged → no commit.
+        assert!(!commit_paths(wt.path(), &[], "noop").unwrap(), "empty paths = no commit");
         remove(repo.path(), wt.path());
     }
 

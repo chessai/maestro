@@ -23,8 +23,14 @@ use crate::worktree;
 /// The outcome of running the mechanical gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateOutcome {
-    /// Scope check + all check commands passed.
-    Passed,
+    /// Scope check + all check commands passed. `changed` is the set of changed
+    /// files that matched the allowlist, captured at the scope-check step —
+    /// BEFORE the check commands ran, so it contains ONLY the implementer's
+    /// clean edits and never post-build artifacts (e.g. `target/`) that a check
+    /// command may have created. The caller restricts the verifier diff + the
+    /// task-branch commit to exactly these paths (see `worktree::diff_paths` /
+    /// `commit_paths`).
+    Passed { changed: Vec<String> },
     /// One or more changed paths fell outside the allowlist (terminal).
     ScopeViolation { offending: Vec<String> },
     /// Every changed path was in-allowlist, but the count of changed files
@@ -90,6 +96,16 @@ pub fn run(
         return Ok(GateOutcome::ScopeViolation { offending });
     }
 
+    // The in-allowlist changed set, captured HERE — before check commands run,
+    // so no build artifacts exist yet. Returned on the `Passed` arm so the caller
+    // restricts the verifier diff + the committed branch to exactly these paths.
+    // With no offending paths this is the full `changed` set.
+    let in_allowlist: Vec<String> = changed
+        .iter()
+        .filter(|path| set.is_match(path))
+        .cloned()
+        .collect();
+
     // --- 1b. Tightened blast-radius cap (ADR-004 / ADR-007) --------------
     // All changed paths are in-allowlist. When a tightened cap is active and
     // the changed-file count exceeds it, this is a (tightened) scope violation.
@@ -130,7 +146,9 @@ pub fn run(
         }
     }
 
-    Ok(GateOutcome::Passed)
+    Ok(GateOutcome::Passed {
+        changed: in_allowlist,
+    })
 }
 
 #[cfg(test)]
@@ -186,7 +204,10 @@ mod tests {
         let (_repo, wt) = init_worktree_repo();
         std::fs::write(wt.path().join("src.rs"), "//\n").unwrap();
         let out = run(wt.path(), "HEAD", &["*.rs".into()], None, &[], &l0_spec(wt.path())).unwrap();
-        assert_eq!(out, GateOutcome::Passed);
+        match out {
+            GateOutcome::Passed { changed } => assert_eq!(changed, vec!["src.rs".to_string()]),
+            other => panic!("expected Passed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -271,7 +292,10 @@ mod tests {
             &l0_spec(wt.path()),
         )
         .unwrap();
-        assert_eq!(out, GateOutcome::Passed, "changed == cap is within the cap");
+        assert!(
+            matches!(out, GateOutcome::Passed { .. }),
+            "changed == cap is within the cap, got {out:?}"
+        );
     }
 
     // (c) None cap → never a tightened violation even with many changed files.
@@ -288,7 +312,10 @@ mod tests {
             &l0_spec(wt.path()),
         )
         .unwrap();
-        assert_eq!(out, GateOutcome::Passed);
+        assert!(
+            matches!(out, GateOutcome::Passed { .. }),
+            "None cap never violates, got {out:?}"
+        );
     }
 
     // (d) An out-of-allowlist path with a tightened cap set still returns a plain
