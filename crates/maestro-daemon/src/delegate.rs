@@ -490,6 +490,54 @@ fn next_configured_tier(rp: &ResolvedProfile, tier: Tier) -> Option<Tier> {
         .find(|&candidate| candidate > tier && role_for_tier(rp, candidate).is_some())
 }
 
+/// The number of CONFIGURED tiers in the escalation ladder from `start` up to
+/// (and including) `top_tier(rp, start)` (ADR-007). `start` always counts (its
+/// model was resolved at delegate time); each configured tier strictly above
+/// `start` and ≤ the ladder top is also counted (gaps are skipped). Never < 1.
+fn ladder_tier_count(rp: &ResolvedProfile, start: Tier) -> i64 {
+    let top = top_tier(rp, start);
+    // `start` itself always counts, then walk configured tiers upward to `top`.
+    let mut count = 1i64;
+    let mut tier = start;
+    while tier < top {
+        match next_configured_tier(rp, tier) {
+            Some(next) if next <= top => {
+                count += 1;
+                tier = next;
+            }
+            _ => break,
+        }
+    }
+    count
+}
+
+/// Compute the task-lifetime token ceiling (ADR-003 / ADR-007). Pure given its
+/// inputs. Precedence:
+///   1. An explicit `spec.lifetime_budget.tokens` ALWAYS wins (unchanged).
+///   2. Else, derive from `lifetime.token_factor` ONLY when a per-attempt token
+///      budget (`spec.budget.tokens`) is set AND `token_factor > 0`:
+///      `factor × per_attempt × num_tiers`, rounded, clamped up to at least a
+///      single attempt's budget (`per_attempt`) so a ceiling can never be below
+///      one attempt (which would guarantee immediate `budget_exhausted`).
+///      `num_tiers` is the configured escalation ladder length from `spec.tier`
+///      up to its top (v1: every tier shares `spec.budget.tokens`, so the sum
+///      over the ladder is `per_attempt × num_tiers`).
+///   3. Else → `None` (no token ceiling; preserves specs with no per-attempt
+///      token budget).
+fn derive_token_ceiling(spec: &TaskSpec, rp: &ResolvedProfile) -> Option<i64> {
+    if let Some(v) = spec.lifetime_budget.tokens {
+        return Some(v);
+    }
+    let per_attempt = spec.budget.tokens?;
+    let factor = rp.lifetime.token_factor;
+    if factor <= 0.0 {
+        return None;
+    }
+    let num_tiers = ladder_tier_count(rp, spec.tier);
+    let derived = (factor * (per_attempt as f64) * (num_tiers as f64)).round() as i64;
+    Some(derived.max(per_attempt))
+}
+
 /// Validate a spec's acceptance criteria (ADR-003): every criterion must be a
 /// command or a falsifiable invariant with a non-empty `check`. Adjective-only
 /// or empty checks are rejected.
@@ -831,13 +879,18 @@ fn run_pipeline(
 
     // Resolve the task-lifetime ceilings ONCE (ADR-003 "Task-lifetime ceilings").
     // The per-attempt `budget` re-derives per tier; these bound the whole ladder.
-    // - token_ceiling: only the spec sets it (no invented default — a
-    //   config.lifetime.token_factor-derived default is a future refinement, and
-    //   inventing one here would break existing tests that set no token budget).
+    // - token_ceiling (ADR-007): an explicit `spec.lifetime_budget.tokens` always
+    //   wins; else, when a per-attempt token budget is set and the profile's
+    //   `lifetime.token_factor > 0`, derive a default ceiling of
+    //   `token_factor × per_attempt × ladder_tier_count` (the sum of per-tier
+    //   attempt budgets up the ladder, since v1 every tier shares
+    //   `spec.budget.tokens`), clamped up to at least a single attempt's budget.
+    //   With no per-attempt token budget (or factor ≤ 0) there is no ceiling —
+    //   preserving specs that set no token budget. See `derive_token_ceiling`.
     // - wall_clock_ceiling_minutes: the spec if set, else the profile/config
     //   `lifetime.wall_clock_minutes` (default 30, large enough that fast tests
     //   never trip it).
-    let token_ceiling: Option<i64> = spec.lifetime_budget.tokens;
+    let token_ceiling: Option<i64> = derive_token_ceiling(spec, &rp);
     let wall_clock_ceiling_minutes: Option<i64> = spec
         .lifetime_budget
         .wall_clock_minutes
@@ -1762,6 +1815,79 @@ mod tests {
                 .unwrap_or_else(|| panic!("kind {kind} must be unavailable"));
             assert_eq!(err.kind_str(), "model_unavailable", "kind {kind}");
         }
+    }
+
+    // ADR-007: ladder_tier_count counts configured tiers from `start` up to the
+    // ladder top, skipping gaps, always ≥ 1.
+    #[test]
+    fn ladder_tier_count_counts_configured_tiers() {
+        // tier0 + tier2 configured, gap at tier1.
+        let toml = r#"
+[defaults]
+[profiles.p]
+roles.tier0 = "mock"
+roles.tier2 = "mock2"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let rp = ResolvedProfile::merge(&cfg.defaults, cfg.profiles.get("p"));
+        // Start T0 → ladder is [T0, T2] → 2 (gap at T1 skipped).
+        assert_eq!(ladder_tier_count(&rp, Tier::T0), 2);
+        // Start T2 → ladder is just [T2] → 1.
+        assert_eq!(ladder_tier_count(&rp, Tier::T2), 1);
+
+        // Only tier0 configured → count 1 regardless of start.
+        let toml_one = r#"
+[defaults]
+[profiles.p]
+roles.tier0 = "mock"
+"#;
+        let cfg1 = Config::from_toml_str(toml_one).unwrap();
+        let rp1 = ResolvedProfile::merge(&cfg1.defaults, cfg1.profiles.get("p"));
+        assert_eq!(ladder_tier_count(&rp1, Tier::T0), 1);
+    }
+
+    // ADR-007: derive_token_ceiling precedence — explicit spec wins; else derive
+    // from token_factor when a per-attempt token budget is set; else None.
+    #[test]
+    fn derive_token_ceiling_rules() {
+        // A profile with tier0 + tier1 configured → 2-tier ladder from T0.
+        let toml = r#"
+[defaults]
+[profiles.p]
+roles.tier0 = "mock"
+roles.tier1 = "mock1"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let rp = ResolvedProfile::merge(&cfg.defaults, cfg.profiles.get("p"));
+        assert_eq!(ladder_tier_count(&rp, Tier::T0), 2);
+        assert_eq!(rp.lifetime.token_factor, 1.0);
+
+        let base = spec(vec![crit("AC1", "cargo test", CriterionKind::Command)]);
+
+        // per_attempt = 1000, factor 1.0, 2-tier ladder → derived 2000.
+        let mut s = base.clone();
+        s.budget.tokens = Some(1000);
+        assert_eq!(derive_token_ceiling(&s, &rp), Some(2000));
+
+        // Explicit lifetime_budget.tokens wins even with a per-attempt budget set.
+        let mut s2 = s.clone();
+        s2.lifetime_budget.tokens = Some(500);
+        assert_eq!(derive_token_ceiling(&s2, &rp), Some(500));
+
+        // No per-attempt token budget → no ceiling.
+        let s3 = base.clone();
+        assert_eq!(derive_token_ceiling(&s3, &rp), None);
+
+        // factor ≤ 0 → no derived ceiling (still None with no explicit spec value).
+        let mut rp0 = rp.clone();
+        rp0.lifetime.token_factor = 0.0;
+        assert_eq!(derive_token_ceiling(&s, &rp0), None);
+
+        // Clamp: derived below a single attempt is raised to per_attempt.
+        // factor 0.4 × 1000 × 2 = 800 → still ≥ 1000? no: 800 < 1000 → clamp 1000.
+        let mut rp_small = rp.clone();
+        rp_small.lifetime.token_factor = 0.4;
+        assert_eq!(derive_token_ceiling(&s, &rp_small), Some(1000));
     }
 
     // The role for a tier carries kind + base_url from the Detailed table.
