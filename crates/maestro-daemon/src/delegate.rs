@@ -304,6 +304,36 @@ fn containment_floor(rp: &ResolvedProfile, tier: Tier, spec_min: u8) -> u8 {
     profile_min.max(spec_min)
 }
 
+/// The tightened changed-file-count cap for a task (ADR-004 / ADR-007), or
+/// `None` when no tightening is active. This is the ONLY tightening lever with
+/// real teeth in the current architecture: when tightening is active the gate
+/// additionally rejects any diff that changes MORE files than
+/// `ceil(allowlist_factor × allowlist_len)`, bounding blast radius on weakly-
+/// contained / codex tasks. Pure given its inputs.
+///
+/// Tightening is ACTIVE iff the containment recipe was downgraded, OR the
+/// profile's `codex_tighten` is set AND the role is a `driven_cli` role. With an
+/// empty allowlist there is nothing to narrow (an empty allowlist already fails
+/// any change), so the cap is `None`. Otherwise the cap is never below 1.
+fn tighten_file_cap(
+    rp: &ResolvedProfile,
+    recipe: &ContainmentRecipe,
+    role: &ResolvedRole,
+    spec: &TaskSpec,
+) -> Option<usize> {
+    let active =
+        recipe.downgraded || (rp.codex_tighten && role.kind.as_deref() == Some("driven_cli"));
+    if !active {
+        return None;
+    }
+    if spec.file_allowlist.is_empty() {
+        return None;
+    }
+    let factor = rp.tighten.allowlist_factor.clamp(0.0, 1.0);
+    let cap = (factor * spec.file_allowlist.len() as f64).ceil() as usize;
+    Some(cap.max(1))
+}
+
 /// The fully-resolved containment recipe for a task (ADR-004). Computed ONCE at
 /// delegation time and reused for the whole task — escalation may raise the
 /// model but never lowers containment, so the effective level is fixed here.
@@ -718,6 +748,19 @@ fn run_worker(
                 factor,
                 "containment downgraded: tightened per-attempt turn budget (enforcement deferred)"
             );
+        }
+        // The allowlist cap (ADR-004) IS enforced at the mechanical gate: log the
+        // computed changed-file cap so the tightening stays observable.
+        if let Ok(rp) = resolved_profile(state.profile_flag.as_deref()) {
+            if let Some(cap) = tighten_file_cap(&rp, &recipe, &role, &spec) {
+                tracing::info!(
+                    task = %task_id,
+                    allowlist_len = spec.file_allowlist.len(),
+                    allowlist_factor = rp.tighten.allowlist_factor,
+                    changed_file_cap = cap,
+                    "containment downgraded: gate will enforce a tightened changed-file cap"
+                );
+            }
         }
     }
 
@@ -1455,11 +1498,16 @@ fn run_gate_and_verify(
     // recipe as the task (ADR-004 "verification surfaces inherit the task
     // recipe"). At L0 the wrap is identity, so behavior is unchanged from M3.
     let sandbox = recipe.spec_for(worktree_path);
+    // Tightened blast-radius cap (ADR-004 / ADR-007): when tightening is active
+    // (containment downgrade OR codex_tighten on a driven_cli role), the gate
+    // additionally rejects a diff that changes more files than the tightened cap.
+    let max_changed_files = tighten_file_cap(rp, recipe, role, spec);
     emit(state, task_id, EventKind::ChecksStarted, None);
     let gate_outcome = gate::run(
         worktree_path,
         base_ref,
         &spec.file_allowlist,
+        max_changed_files,
         &spec.check_commands,
         &sandbox,
     )
@@ -1472,6 +1520,27 @@ fn run_gate_and_verify(
                 "scope_violation",
                 "changed paths fell outside the file allowlist",
                 Some(serde_json::json!({ "offending_paths": offending })),
+            );
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            Ok(AttemptOutcome::ScopeViolation)
+        }
+        GateOutcome::TightenedScopeExceeded { changed, cap, files } => {
+            // TERMINAL — the diff stayed in-allowlist but exceeded the tightened
+            // changed-file cap (containment downgrade / codex_tighten). Still a
+            // scope violation (reuse the kind), NOT escalation fuel (ADR-004).
+            let message = format!(
+                "changed {changed} files, exceeding the tightened allowlist cap of {cap} \
+                 (containment downgrade / codex_tighten)"
+            );
+            let payload = failure_payload(
+                "scope_violation",
+                &message,
+                Some(serde_json::json!({
+                    "reason": "tightened_allowlist",
+                    "changed": changed,
+                    "cap": cap,
+                    "offending_paths": files,
+                })),
             );
             emit(state, task_id, EventKind::Failed, Some(&payload));
             Ok(AttemptOutcome::ScopeViolation)
@@ -1928,5 +1997,97 @@ roles.tier1 = { model = "qwen", kind = "openai_compat", base_url = "http://local
         assert_eq!(t1.model, "qwen");
         assert_eq!(t1.kind.as_deref(), Some("openai_compat"));
         assert_eq!(t1.base_url.as_deref(), Some("http://localhost:11434/v1"));
+    }
+
+    /// A `ContainmentRecipe` fixture with the given `downgraded` flag. Only the
+    /// `downgraded` field matters to `tighten_file_cap`.
+    fn recipe_with_downgraded(downgraded: bool) -> ContainmentRecipe {
+        ContainmentRecipe {
+            level: maestro_sandbox::Level::L0,
+            backend: maestro_sandbox::Backend::None,
+            network: maestro_sandbox::NetworkPolicy::Deny,
+            flake_dir: PathBuf::from("/repo"),
+            devshell_variant: None,
+            podman_image: None,
+            requested: maestro_sandbox::Level::L0,
+            downgraded,
+        }
+    }
+
+    /// A `ResolvedRole` fixture with the given backend `kind`.
+    fn role_with_kind(kind: Option<&str>) -> ResolvedRole {
+        ResolvedRole {
+            model: "mock".into(),
+            kind: kind.map(str::to_string),
+            base_url: None,
+            command: None,
+            args: None,
+            adapter: None,
+        }
+    }
+
+    /// A spec fixture carrying an `allowlist` of `n` distinct globs.
+    fn spec_with_allowlist(n: usize) -> TaskSpec {
+        let mut s = spec(vec![crit("AC1", "cargo test", CriterionKind::Command)]);
+        s.file_allowlist = (0..n).map(|i| format!("src/f{i}.rs")).collect();
+        s
+    }
+
+    // ADR-004 / ADR-007: tighten_file_cap — the enforced changed-file cap.
+    #[test]
+    fn tighten_file_cap_rules() {
+        // Base profile with default tighten factors (allowlist_factor 0.5).
+        let rp = ResolvedProfile::merge(&Default::default(), None);
+        assert_eq!(rp.tighten.allowlist_factor, 0.5);
+        assert!(!rp.codex_tighten);
+
+        let anthropic = role_with_kind(None);
+        let driven = role_with_kind(Some("driven_cli"));
+
+        // Downgraded recipe + allowlist of 4 + factor 0.5 → Some(2).
+        assert_eq!(
+            tighten_file_cap(&rp, &recipe_with_downgraded(true), &anthropic, &spec_with_allowlist(4)),
+            Some(2)
+        );
+
+        // codex_tighten + driven_cli role + allowlist 4 + factor 0.5 → Some(2).
+        let mut rp_codex = rp.clone();
+        rp_codex.codex_tighten = true;
+        assert_eq!(
+            tighten_file_cap(&rp_codex, &recipe_with_downgraded(false), &driven, &spec_with_allowlist(4)),
+            Some(2)
+        );
+
+        // codex_tighten + NON-driven role → None (not active).
+        assert_eq!(
+            tighten_file_cap(&rp_codex, &recipe_with_downgraded(false), &anthropic, &spec_with_allowlist(4)),
+            None
+        );
+
+        // Neither downgraded nor codex_tighten → None.
+        assert_eq!(
+            tighten_file_cap(&rp, &recipe_with_downgraded(false), &driven, &spec_with_allowlist(4)),
+            None
+        );
+
+        // Active but empty allowlist → None (nothing to narrow).
+        assert_eq!(
+            tighten_file_cap(&rp, &recipe_with_downgraded(true), &anthropic, &spec_with_allowlist(0)),
+            None
+        );
+
+        // factor 0.5 with allowlist len 1 → ceil(0.5)=1 (min-1 clamp holds).
+        assert_eq!(
+            tighten_file_cap(&rp, &recipe_with_downgraded(true), &anthropic, &spec_with_allowlist(1)),
+            Some(1)
+        );
+
+        // factor 0.25 len 3 → ceil(0.75) = 1.
+        let mut rp_quarter = rp.clone();
+        rp_quarter.tighten.allowlist_factor = 0.25;
+        assert_eq!(
+            tighten_file_cap(&rp_quarter, &recipe_with_downgraded(true), &anthropic, &spec_with_allowlist(3)),
+            Some(1)
+        );
     }
 }

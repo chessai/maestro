@@ -27,6 +27,17 @@ pub enum GateOutcome {
     Passed,
     /// One or more changed paths fell outside the allowlist (terminal).
     ScopeViolation { offending: Vec<String> },
+    /// Every changed path was in-allowlist, but the count of changed files
+    /// exceeded a tightened cap (ADR-004 / ADR-007). Terminal — a tightened
+    /// blast-radius bound applied on a containment downgrade / codex_tighten.
+    TightenedScopeExceeded {
+        /// The number of changed files.
+        changed: usize,
+        /// The tightened cap (`ceil(allowlist_factor × allowlist_len)`, min 1).
+        cap: usize,
+        /// The changed paths (capped to a reasonable number for the payload).
+        files: Vec<String>,
+    },
     /// A check command exited non-zero.
     ChecksFailed {
         command: String,
@@ -38,6 +49,10 @@ pub enum GateOutcome {
 /// Cap on the captured check-command output stored in the journal payload.
 const OUTPUT_DIGEST_CAP: usize = 4000;
 
+/// Cap on the number of changed-file paths recorded in a
+/// `TightenedScopeExceeded` payload (bounds the journal write).
+const TIGHTENED_FILES_CAP: usize = 50;
+
 /// Run the mechanical gate against a worktree, running each check command under
 /// the task's containment `spec` (ADR-004). A `wrap` failure (e.g. the podman
 /// backend needs an image) is surfaced as an `Err` — the caller turns it into an
@@ -46,6 +61,7 @@ pub fn run(
     worktree_path: &Path,
     base_ref: &str,
     file_allowlist: &[String],
+    max_changed_files: Option<usize>,
     check_commands: &[String],
     spec: &SandboxSpec,
 ) -> Result<GateOutcome> {
@@ -61,12 +77,31 @@ pub fn run(
     }
     let set = builder.build().context("building allowlist glob set")?;
 
+    // Any out-of-allowlist path is a plain ScopeViolation and wins FIRST. We
+    // keep the full changed-file count + list around for the tightened-cap
+    // check below, since the allowlist filter consumes `changed`.
+    let changed_count = changed.len();
     let offending: Vec<String> = changed
-        .into_iter()
+        .iter()
         .filter(|path| !set.is_match(path))
+        .cloned()
         .collect();
     if !offending.is_empty() {
         return Ok(GateOutcome::ScopeViolation { offending });
+    }
+
+    // --- 1b. Tightened blast-radius cap (ADR-004 / ADR-007) --------------
+    // All changed paths are in-allowlist. When a tightened cap is active and
+    // the changed-file count exceeds it, this is a (tightened) scope violation.
+    if let Some(cap) = max_changed_files {
+        if changed_count > cap {
+            let files: Vec<String> = changed.into_iter().take(TIGHTENED_FILES_CAP).collect();
+            return Ok(GateOutcome::TightenedScopeExceeded {
+                changed: changed_count,
+                cap,
+                files,
+            });
+        }
     }
 
     // --- 2. Check commands (fresh, in the worktree, contained) -----------
@@ -150,7 +185,7 @@ mod tests {
     fn in_allowlist_change_passes() {
         let (_repo, wt) = init_worktree_repo();
         std::fs::write(wt.path().join("src.rs"), "//\n").unwrap();
-        let out = run(wt.path(), "HEAD", &["*.rs".into()], &[], &l0_spec(wt.path())).unwrap();
+        let out = run(wt.path(), "HEAD", &["*.rs".into()], None, &[], &l0_spec(wt.path())).unwrap();
         assert_eq!(out, GateOutcome::Passed);
     }
 
@@ -158,7 +193,7 @@ mod tests {
     fn out_of_allowlist_change_is_scope_violation() {
         let (_repo, wt) = init_worktree_repo();
         std::fs::write(wt.path().join("evil.txt"), "x\n").unwrap();
-        let out = run(wt.path(), "HEAD", &["*.rs".into()], &[], &l0_spec(wt.path())).unwrap();
+        let out = run(wt.path(), "HEAD", &["*.rs".into()], None, &[], &l0_spec(wt.path())).unwrap();
         match out {
             GateOutcome::ScopeViolation { offending } => {
                 assert_eq!(offending, vec!["evil.txt".to_string()]);
@@ -171,7 +206,7 @@ mod tests {
     fn empty_allowlist_with_change_is_violation() {
         let (_repo, wt) = init_worktree_repo();
         std::fs::write(wt.path().join("a.rs"), "//\n").unwrap();
-        let out = run(wt.path(), "HEAD", &[], &[], &l0_spec(wt.path())).unwrap();
+        let out = run(wt.path(), "HEAD", &[], None, &[], &l0_spec(wt.path())).unwrap();
         assert!(matches!(out, GateOutcome::ScopeViolation { .. }));
     }
 
@@ -183,11 +218,101 @@ mod tests {
             wt.path(),
             "HEAD",
             &["*.rs".into()],
+            None,
             &["exit 3".into()],
             &l0_spec(wt.path()),
         )
         .unwrap();
         assert!(matches!(out, GateOutcome::ChecksFailed { .. }));
+    }
+
+    /// Write `n` distinct in-allowlist `*.rs` files into the worktree.
+    fn write_rs_files(wt: &Path, n: usize) {
+        for i in 0..n {
+            std::fs::write(wt.join(format!("f{i}.rs")), "//\n").unwrap();
+        }
+    }
+
+    // (a) 3 in-allowlist files with a tightened cap of 2 → TightenedScopeExceeded.
+    #[test]
+    fn tightened_cap_exceeded_when_changed_over_cap() {
+        let (_repo, wt) = init_worktree_repo();
+        write_rs_files(wt.path(), 3);
+        let out = run(
+            wt.path(),
+            "HEAD",
+            &["*.rs".into()],
+            Some(2),
+            &[],
+            &l0_spec(wt.path()),
+        )
+        .unwrap();
+        match out {
+            GateOutcome::TightenedScopeExceeded { changed, cap, files } => {
+                assert_eq!(changed, 3);
+                assert_eq!(cap, 2);
+                assert_eq!(files.len(), 3, "all 3 in-allowlist paths recorded");
+            }
+            other => panic!("expected TightenedScopeExceeded, got {other:?}"),
+        }
+    }
+
+    // (b) Same diff with cap 3 → NOT exceeded; proceeds to Passed (no checks).
+    #[test]
+    fn tightened_cap_at_boundary_passes() {
+        let (_repo, wt) = init_worktree_repo();
+        write_rs_files(wt.path(), 3);
+        let out = run(
+            wt.path(),
+            "HEAD",
+            &["*.rs".into()],
+            Some(3),
+            &[],
+            &l0_spec(wt.path()),
+        )
+        .unwrap();
+        assert_eq!(out, GateOutcome::Passed, "changed == cap is within the cap");
+    }
+
+    // (c) None cap → never a tightened violation even with many changed files.
+    #[test]
+    fn tightened_cap_none_never_violates() {
+        let (_repo, wt) = init_worktree_repo();
+        write_rs_files(wt.path(), 5);
+        let out = run(
+            wt.path(),
+            "HEAD",
+            &["*.rs".into()],
+            None,
+            &[],
+            &l0_spec(wt.path()),
+        )
+        .unwrap();
+        assert_eq!(out, GateOutcome::Passed);
+    }
+
+    // (d) An out-of-allowlist path with a tightened cap set still returns a plain
+    // ScopeViolation — the allowlist check wins FIRST.
+    #[test]
+    fn out_of_allowlist_wins_over_tightened_cap() {
+        let (_repo, wt) = init_worktree_repo();
+        write_rs_files(wt.path(), 3);
+        std::fs::write(wt.path().join("evil.txt"), "x\n").unwrap();
+        let out = run(
+            wt.path(),
+            "HEAD",
+            &["*.rs".into()],
+            Some(2),
+            &[],
+            &l0_spec(wt.path()),
+        )
+        .unwrap();
+        match out {
+            GateOutcome::ScopeViolation { offending } => {
+                assert_eq!(offending, vec!["evil.txt".to_string()]);
+            }
+            other => panic!("expected plain ScopeViolation, got {other:?}"),
+        }
     }
 
     // AC5: at L1 with Backend::Bwrap the gate wraps `check_command` as
