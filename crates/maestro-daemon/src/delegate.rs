@@ -64,12 +64,16 @@ pub struct DelegationState {
     /// proxy in `run_attempt` (via `proxy_addr` below) when this is `Some`.
     proxy_ledger: Option<Arc<maestro_proxy::Ledger>>,
     /// The bound address of the streaming credential proxy (ADR-006), present
-    /// only when the proxy is enabled (OPT-IN; default `None`). When set, the
-    /// one-shot implementer backend is built targeting `http://{addr}` INSTEAD of
-    /// the role's upstream base_url, so its Anthropic calls route through the
-    /// proxy (which injects the key + meters + hard-stops on the ceiling). Only
-    /// the implementer is routed — never the verifier or shim (ADR-002:
-    /// verification is never skipped). `None` on the default path.
+    /// only when the proxy is enabled (now default-ON; `None` when it failed to
+    /// bind or was disabled). When set, the one-shot implementer backend is built
+    /// targeting `http://{addr}` INSTEAD of the role's upstream base_url, so its
+    /// Anthropic calls route through the proxy (which injects the key + meters +
+    /// hard-stops on the ceiling). The non-mock VERIFIER is also routed here, but
+    /// METER-ONLY (via `X-Maestro-Meter` vs the implementer's gated
+    /// `X-Maestro-Task`): the proxy meters its usage into the ledger so total task
+    /// spend is accurate, but never gates or hard-stops it (ADR-002: verification
+    /// is never skipped). The shim is never routed. `None` on the proxy-off path
+    /// (all backends go direct).
     proxy_addr: Option<String>,
 }
 
@@ -522,13 +526,23 @@ fn select_verifier(rp: &ResolvedProfile, impl_model: &str) -> Option<(ResolvedRo
     None
 }
 
+/// Whether a resolved verifier role is the mock backend (never routed / no net).
+fn verifier_role_is_mock(role: &ResolvedRole) -> bool {
+    role.model == "mock" || role.kind.as_deref() == Some("mock")
+}
+
 /// Select the verifier backend for a resolved verifier role: `mock` → the
-/// deterministic [`MockVerifier`], else the [`AnthropicVerifier`].
-fn select_verifier_backend(role: &ResolvedRole) -> Box<dyn VerifierBackend> {
-    if role.model == "mock" || role.kind.as_deref() == Some("mock") {
+/// deterministic [`MockVerifier`], else the [`AnthropicVerifier`] built with
+/// `effective_base_url` (the proxy address when the proxy is enabled and this is
+/// a non-mock verifier — see `run_verifier` — else the role's own base_url).
+fn select_verifier_backend(
+    role: &ResolvedRole,
+    effective_base_url: Option<String>,
+) -> Box<dyn VerifierBackend> {
+    if verifier_role_is_mock(role) {
         Box::new(MockVerifier)
     } else {
-        Box::new(AnthropicVerifier::new(role.base_url.clone()))
+        Box::new(AnthropicVerifier::new(effective_base_url))
     }
 }
 
@@ -1704,7 +1718,26 @@ fn run_verifier(
             "no eligible verifier model configured (verification never skipped, ADR-002)",
         )
     })?;
-    let backend = select_verifier_backend(&verifier_role);
+
+    // Proxy routing (ADR-006): when the streaming credential proxy is enabled AND
+    // the verifier model is non-mock, route the verifier's Anthropic calls through
+    // the daemon-local proxy (`http://{addr}`) META-ONLY: the proxy injects the
+    // key upstream and METERS the verifier's usage into the per-task ledger (so
+    // the ledger reflects TOTAL task spend, making the implementer's pre-forward
+    // gate accurate), but NEVER gates or hard-stops the verifier — it must always
+    // run (ADR-002 "verification never skipped"). The `X-Maestro-Meter` header
+    // (vs the implementer's gated `X-Maestro-Task`) carries the meter-only
+    // semantics. The MOCK verifier is never routed (it makes no network call). On
+    // the proxy-off path (`proxy_addr` is `None`) the verifier uses its role's
+    // base_url unchanged and sends no header — the direct path is untouched.
+    let verifier_is_mock = verifier_role_is_mock(&verifier_role);
+    let (verifier_base_url, meter_header) = match state.proxy_addr.as_deref() {
+        Some(addr) if !verifier_is_mock => {
+            (Some(format!("http://{addr}")), Some(task_id.to_string()))
+        }
+        _ => (verifier_role.base_url.clone(), None),
+    };
+    let backend = select_verifier_backend(&verifier_role, verifier_base_url);
 
     // The verifier MAY run bounded commands in a THROWAWAY COPY of the
     // implementer's worktree, severed from the repo (ADR-002). Built here (lazily
@@ -1738,8 +1771,13 @@ fn run_verifier(
             diff: diff.to_string(),
             gate_output: gate_output.to_string(),
             model: verifier_role.model.clone(),
+            // The AnthropicVerifier was already built with the effective base_url
+            // (proxy or role), so `base_url` here is redundant for it; keep the
+            // role's value for provenance. `meter_header` carries the meter-only
+            // routing tag when the proxy is enabled (non-mock).
             base_url: verifier_role.base_url.clone(),
             prior_reports: prior_reports.to_vec(),
+            meter_header: meter_header.clone(),
         };
 
         match backend.verify(&vtask, &runner) {

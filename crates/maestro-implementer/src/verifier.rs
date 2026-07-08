@@ -202,6 +202,13 @@ pub struct VerifyTask {
     pub base_url: Option<String>,
     /// Earlier verifier reports, for escalation context (ADR-002 / ADR-003).
     pub prior_reports: Vec<ReportBody>,
+    /// The METER-ONLY task id sent as `X-Maestro-Meter` when the verifier is
+    /// routed through the streaming credential proxy (ADR-006). When `Some`, the
+    /// proxy meters the verifier's usage into the per-task ledger (so total task
+    /// spend is accurate) but NEVER gates or hard-stops it — the verifier must
+    /// always run (ADR-002 "verification never skipped"). `None` on the direct
+    /// (proxy-off) path, where no such header is sent.
+    pub meter_header: Option<String>,
 }
 
 /// A verifier's account of a verification: the report plus telemetry.
@@ -372,7 +379,7 @@ impl VerifierBackend for AnthropicVerifier {
             turns += 1;
 
             let body = build_verify_request_body(task, &messages);
-            let response = send(&url, &api_key, &body)?;
+            let response = send(&url, &api_key, task.meter_header.as_deref(), &body)?;
 
             if let Some(usage) = response.get("usage") {
                 tokens_in += usage
@@ -685,12 +692,28 @@ pub fn build_verify_request_body(task: &VerifyTask, prior_messages: &[Value]) ->
 /// Send one request and parse the JSON response, mapping transport/status
 /// errors to [`ImplementerError::Http`] and parse failures to
 /// [`ImplementerError::Protocol`].
-fn send(url: &str, api_key: &str, body: &Value) -> Result<Value, ImplementerError> {
-    let resp = ureq::post(url)
+///
+/// When `meter_header` is `Some`, the request carries an `X-Maestro-Meter` header
+/// so the daemon's streaming credential proxy meters the verifier's usage into
+/// the per-task ledger (making the implementer's pre-forward gate reflect TOTAL
+/// task spend). It is METER-ONLY: the proxy never gates or hard-stops a verifier
+/// request, so no `429 budget_exhausted` mapping is needed here (ADR-002
+/// "verification never skipped"). On the direct (proxy-off) path `meter_header`
+/// is `None` and no such header is sent — the request is identical to before.
+fn send(
+    url: &str,
+    api_key: &str,
+    meter_header: Option<&str>,
+    body: &Value,
+) -> Result<Value, ImplementerError> {
+    let mut req = ureq::post(url)
         .set("x-api-key", api_key)
         .set("anthropic-version", ANTHROPIC_VERSION)
-        .set("content-type", "application/json")
-        .send_json(body);
+        .set("content-type", "application/json");
+    if let Some(mid) = meter_header {
+        req = req.set("X-Maestro-Meter", mid);
+    }
+    let resp = req.send_json(body);
 
     match resp {
         Ok(r) => r
@@ -738,6 +761,7 @@ mod tests {
             model: model.into(),
             base_url: None,
             prior_reports: Vec::new(),
+            meter_header: None,
         }
     }
 

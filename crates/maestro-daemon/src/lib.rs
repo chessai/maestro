@@ -449,6 +449,9 @@ fn dispatch(req: Request, state: &SharedState) -> Response {
 ///   without constructing a backend.
 /// - any other value → `backend_unavailable: unknown search backend` (fail-loud).
 fn search_handler(state: &SharedState, advisor_session_id: &str, queries: &[String]) -> Response {
+    // The shim is intentionally NOT routed through the credential proxy: it is
+    // advisor-scoped with no task budget, already journaled, and runs in-daemon —
+    // so the proxy would give it no key-hiding benefit (ADR-005 / ADR-006).
     use maestro_journal::config::RoleModel;
     use maestro_shim::{AnthropicSearchBackend, SearxngBackend};
 
@@ -507,6 +510,9 @@ fn fetch_extract_handler(
     url: &str,
     schema_fields: &[String],
 ) -> Response {
+    // The shim is intentionally NOT routed through the credential proxy: it is
+    // advisor-scoped with no task budget, already journaled, and runs in-daemon —
+    // so the proxy would give it no key-hiding benefit (ADR-005 / ADR-006).
     use maestro_journal::config::RoleModel;
     use maestro_shim::AnthropicExtractionModel;
 

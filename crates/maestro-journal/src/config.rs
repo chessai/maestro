@@ -144,14 +144,18 @@ impl Default for LifetimeFactors {
 /// Streaming credential proxy config (ADR-006 / ADR-004). The proxy is the
 /// daemon-local endpoint that injects the provider API key upstream, meters
 /// token usage per response, and hard-stops a response mid-stream when a task's
-/// token ceiling is exceeded. It is OPT-IN: `enabled` defaults to `false`, so
-/// the default live delegation path is unchanged unless a profile turns it on.
-/// TOML shape (dotted keys land in the `proxy` table): `proxy.enabled = true`,
-/// `proxy.addr = "127.0.0.1:0"`.
+/// token ceiling is exceeded. It is now ON BY DEFAULT: `enabled` defaults to
+/// `true`, so live delegation routes the implementer (gated) and the verifier
+/// (meter-only) through the proxy unless a profile explicitly disables it with
+/// `proxy.enabled = false`. Startup degrades gracefully — if the proxy fails to
+/// bind, the daemon logs a warning and backends fall back to direct calls (see
+/// `start_proxy`). TOML shape (dotted keys land in the `proxy` table):
+/// `proxy.enabled = false`, `proxy.addr = "127.0.0.1:0"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyConfig {
-    /// Whether to start the proxy at daemon startup. Default `false`.
-    #[serde(default)]
+    /// Whether to start the proxy at daemon startup. Default `true`; an omitted
+    /// `[proxy]` table (or an omitted `proxy.enabled` key) yields `true`.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// The bind address, e.g. `"127.0.0.1:0"` (ephemeral port). Default
     /// `"127.0.0.1:0"`.
@@ -159,6 +163,9 @@ pub struct ProxyConfig {
     pub addr: String,
 }
 
+fn default_true() -> bool {
+    true
+}
 fn default_proxy_addr() -> String {
     "127.0.0.1:0".to_string()
 }
@@ -166,7 +173,7 @@ fn default_proxy_addr() -> String {
 impl Default for ProxyConfig {
     fn default() -> Self {
         ProxyConfig {
-            enabled: false,
+            enabled: default_true(),
             addr: default_proxy_addr(),
         }
     }
@@ -548,30 +555,40 @@ foo = "bar"
         assert!(creds.env.is_empty());
     }
 
-    // ADR-006/ADR-004: the [proxy] table parses on defaults via dotted keys, is
-    // OPT-IN (enabled defaults to false), and defaults addr to "127.0.0.1:0".
+    // ADR-006/ADR-004: the [proxy] table parses on defaults via dotted keys. The
+    // proxy is now ON BY DEFAULT (`enabled` defaults to true), and addr defaults
+    // to "127.0.0.1:0". An explicit `proxy.enabled = false` opts out.
     #[test]
     fn proxy_table_parses_with_defaults() {
-        // Entirely unset → disabled, ephemeral-loopback addr.
+        // Entirely unset → ENABLED by default, ephemeral-loopback addr.
         let empty = Config::from_toml_str("[defaults]\n").unwrap();
-        assert!(!empty.defaults.proxy.enabled);
+        assert!(empty.defaults.proxy.enabled);
         assert_eq!(empty.defaults.proxy.addr, "127.0.0.1:0");
 
-        // Explicitly enabled with a custom addr.
+        // A wholly-omitted config (Config::default) is also enabled.
+        assert!(Config::default().defaults.proxy.enabled);
+
+        // Explicit opt-out with a custom addr.
         let toml = r#"
 [defaults]
-proxy.enabled = true
+proxy.enabled = false
 proxy.addr = "127.0.0.1:8787"
 "#;
         let cfg = Config::from_toml_str(toml).expect("config parses");
-        assert!(cfg.defaults.proxy.enabled);
+        assert!(!cfg.defaults.proxy.enabled);
         assert_eq!(cfg.defaults.proxy.addr, "127.0.0.1:8787");
 
-        // enabled set but addr omitted → serde default addr.
+        // Explicitly enabled but addr omitted → serde default addr.
         let toml2 = "[defaults]\nproxy.enabled = true\n";
         let cfg2 = Config::from_toml_str(toml2).expect("config parses");
         assert!(cfg2.defaults.proxy.enabled);
         assert_eq!(cfg2.defaults.proxy.addr, "127.0.0.1:0");
+
+        // enabled omitted but addr set → enabled stays true (default), addr honored.
+        let toml3 = "[defaults]\nproxy.addr = \"127.0.0.1:9999\"\n";
+        let cfg3 = Config::from_toml_str(toml3).expect("config parses");
+        assert!(cfg3.defaults.proxy.enabled);
+        assert_eq!(cfg3.defaults.proxy.addr, "127.0.0.1:9999");
     }
 
     // A bare-string role stays RoleModel::Bare (⇒ default anthropic backend,

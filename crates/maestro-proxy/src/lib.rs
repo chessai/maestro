@@ -45,8 +45,17 @@ pub struct ProxyConfig {
     pub anthropic_version: String,
 }
 
-/// Header name (lowercased) carrying the metering key: the task id.
+/// Header name (lowercased) carrying the metering key for a GATED caller (the
+/// implementer): the task id. A request with this header is metered into the
+/// ledger AND subject to the pre-forward budget gate + mid-stream hard-stop.
 const TASK_HEADER: &str = "x-maestro-task";
+/// Header name (lowercased) carrying the metering key for a METER-ONLY caller
+/// (the verifier): the task id. A request with this header is metered into the
+/// ledger just like `X-Maestro-Task`, but is NEVER pre-blocked or hard-stopped —
+/// even when its task is already over budget (ADR-002 "verification never
+/// skipped"). It exists so the per-task ledger reflects TOTAL task spend, making
+/// the implementer's own pre-forward gate accurate.
+const METER_HEADER: &str = "x-maestro-meter";
 /// The SSE error event body written to the client on a mid-stream hard-stop.
 const BUDGET_ERROR_EVENT: &str = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"budget_exhausted\",\"message\":\"task token ceiling exceeded mid-stream\"}}\n\n";
 
@@ -107,7 +116,20 @@ fn handle(
     }
 
     // Pull the metering key + inbound anthropic-version before consuming the body.
-    let task_id = header_value(&request, TASK_HEADER);
+    //
+    // Two callers meter into the ledger under a task id:
+    //  - `X-Maestro-Task` (the implementer) is GATED: metered AND subject to the
+    //    pre-forward budget gate + the mid-stream hard-stop.
+    //  - `X-Maestro-Meter` (the verifier) is METER-ONLY: metered so the ledger
+    //    reflects total task spend, but NEVER pre-blocked or hard-stopped (the
+    //    verifier must always run — ADR-002 "verification never skipped").
+    // `X-Maestro-Task` wins when both are present. No header at all → pass-through
+    // (forward + inject key, meter nothing).
+    let task_header = header_value(&request, TASK_HEADER);
+    let meter_key = task_header
+        .clone()
+        .or_else(|| header_value(&request, METER_HEADER));
+    let gated = task_header.is_some();
     let anthropic_version =
         header_value(&request, "anthropic-version").unwrap_or_else(|| cfg.anthropic_version.clone());
 
@@ -115,14 +137,18 @@ fn handle(
     // requests. The implementer is a multi-turn NON-streaming loop, so once a
     // turn's response pushes the ledger over the ceiling, the NEXT turn's request
     // is rejected HERE — without forwarding upstream. (The mid-stream hard-stop in
-    // the streaming path complements this for streamed responses.)
-    if let Some(tid) = task_id.as_deref() {
-        if ledger.over_budget(tid) {
-            return respond_json(
-                request,
-                429,
-                r#"{"error":{"type":"budget_exhausted","message":"task token ceiling already reached"}}"#,
-            );
+    // the streaming path complements this for streamed responses.) Applies ONLY to
+    // a GATED (`X-Maestro-Task`) caller: a meter-only (`X-Maestro-Meter`) request
+    // is never pre-blocked, EVEN when its task is over budget.
+    if gated {
+        if let Some(tid) = meter_key.as_deref() {
+            if ledger.over_budget(tid) {
+                return respond_json(
+                    request,
+                    429,
+                    r#"{"error":{"type":"budget_exhausted","message":"task token ceiling already reached"}}"#,
+                );
+            }
         }
     }
 
@@ -157,7 +183,8 @@ fn handle(
             &key,
             &anthropic_version,
             body,
-            task_id,
+            meter_key,
+            gated,
             ledger,
         )
     } else {
@@ -167,7 +194,7 @@ fn handle(
             &key,
             &anthropic_version,
             body,
-            task_id,
+            meter_key,
             ledger,
         )
     }
@@ -183,7 +210,8 @@ fn handle_streaming(
     key: &str,
     anthropic_version: &str,
     body: String,
-    task_id: Option<String>,
+    meter_key: Option<String>,
+    gated: bool,
     ledger: &Arc<Ledger>,
 ) -> std::io::Result<()> {
     let resp = ureq::post(upstream_url)
@@ -211,7 +239,7 @@ fn handle_streaming(
     };
 
     let reader = upstream.into_reader();
-    let meter = MeteringReader::new(reader, task_id, Arc::clone(ledger));
+    let meter = MeteringReader::new(reader, meter_key, gated, Arc::clone(ledger));
 
     let response = Response::empty(200)
         .with_header(header("content-type", "text/event-stream"))
@@ -229,7 +257,7 @@ fn handle_non_streaming(
     key: &str,
     anthropic_version: &str,
     body: String,
-    task_id: Option<String>,
+    meter_key: Option<String>,
     ledger: &Arc<Ledger>,
 ) -> std::io::Result<()> {
     let resp = ureq::post(upstream_url)
@@ -250,8 +278,9 @@ fn handle_non_streaming(
         }
     };
 
-    // Meter end-of-response usage if we can parse it and have a task id.
-    if let Some(tid) = task_id.as_deref() {
+    // Meter end-of-response usage if we can parse it and have a metering key
+    // (gated `X-Maestro-Task` OR meter-only `X-Maestro-Meter`).
+    if let Some(tid) = meter_key.as_deref() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(usage) = v.get("usage") {
                 let ti = usage.get("input_tokens").and_then(|n| n.as_i64()).unwrap_or(0);
@@ -275,7 +304,13 @@ fn handle_non_streaming(
 /// stream — nothing is buffered whole.
 struct MeteringReader<R: Read> {
     upstream: Option<BufReader<R>>,
-    task_id: Option<String>,
+    /// The metering key (task id) this response accumulates into, if any. Set for
+    /// both a gated (`X-Maestro-Task`) and a meter-only (`X-Maestro-Meter`) caller.
+    meter_key: Option<String>,
+    /// Whether this caller is subject to the mid-stream hard-stop. TRUE only for a
+    /// gated (`X-Maestro-Task`) caller; a meter-only caller meters but is never
+    /// cut off (ADR-002 "verification never skipped").
+    gated: bool,
     ledger: Arc<Ledger>,
     /// Last seen cumulative `output_tokens` for this response (for delta calc).
     last_output: i64,
@@ -288,10 +323,11 @@ struct MeteringReader<R: Read> {
 }
 
 impl<R: Read> MeteringReader<R> {
-    fn new(upstream: R, task_id: Option<String>, ledger: Arc<Ledger>) -> Self {
+    fn new(upstream: R, meter_key: Option<String>, gated: bool, ledger: Arc<Ledger>) -> Self {
         MeteringReader {
             upstream: Some(BufReader::new(upstream)),
-            task_id,
+            meter_key,
+            gated,
             ledger,
             last_output: 0,
             pending: Vec::new(),
@@ -311,7 +347,7 @@ impl<R: Read> MeteringReader<R> {
             Ok(v) => v,
             Err(_) => return false,
         };
-        let Some(tid) = self.task_id.clone() else {
+        let Some(tid) = self.meter_key.clone() else {
             return false;
         };
         match json.get("type").and_then(|t| t.as_str()) {
@@ -340,7 +376,9 @@ impl<R: Read> MeteringReader<R> {
                         self.ledger.add_usage(&tid, 0, delta);
                     }
                 }
-                self.ledger.over_budget(&tid)
+                // The hard-stop applies ONLY to a gated caller. A meter-only
+                // caller meters this delta but is never cut off.
+                self.gated && self.ledger.over_budget(&tid)
             }
             _ => false,
         }

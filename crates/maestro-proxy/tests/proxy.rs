@@ -119,6 +119,20 @@ fn post_through_proxy(proxy_addr: &str, body: &str, task: Option<&str>) -> (u16,
     }
 }
 
+/// POST a body through the proxy with an `X-Maestro-Meter` (meter-only) header,
+/// returning (status, body-string).
+fn post_through_proxy_meter(proxy_addr: &str, body: &str, meter: &str) -> (u16, String) {
+    let url = format!("http://{proxy_addr}/v1/messages");
+    let req = ureq::post(&url)
+        .set("content-type", "application/json")
+        .set("X-Maestro-Meter", meter);
+    match req.send_string(body) {
+        Ok(r) => (r.status(), r.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap_or_default()),
+        Err(e) => panic!("transport error posting through proxy: {e}"),
+    }
+}
+
 fn cfg(upstream_base: &str) -> ProxyConfig {
     ProxyConfig {
         upstream_base: upstream_base.to_string(),
@@ -316,4 +330,88 @@ fn routing_404_and_405() {
         Err(e) => panic!("{e}"),
     };
     assert_eq!(code, 405);
+}
+
+// Meter-only (`X-Maestro-Meter`, the verifier): a request whose task is ALREADY
+// over budget is STILL forwarded (NOT 429) and its usage accumulates into the
+// ledger. This is ADR-002 "verification never skipped": the verifier meters into
+// the per-task ledger so total spend is accurate, but is never pre-blocked.
+#[test]
+fn meter_only_over_budget_still_forwarded_and_metered() {
+    let (upstream, seen, served) = start_mock_upstream(false);
+    let ledger = Arc::new(Ledger::new());
+    // A low ceiling, already crossed → the task is over budget.
+    ledger.register("task-meter", Some(50));
+    ledger.add_usage("task-meter", 40, 20); // 60 >= 50 → over budget
+    assert!(ledger.over_budget("task-meter"));
+
+    let (proxy_addr, _h) = maestro_proxy::spawn(
+        "127.0.0.1:0",
+        cfg(&upstream),
+        Arc::clone(&ledger),
+        key_provider("sk-test"),
+    )
+    .unwrap();
+
+    let (status, body) = post_through_proxy_meter(
+        &proxy_addr.to_string(),
+        r#"{"stream":false}"#,
+        "task-meter",
+    );
+    // NOT pre-blocked: forwarded upstream (200), never 429.
+    assert_eq!(
+        status, 200,
+        "an over-budget meter-only request must still be forwarded; body: {body}"
+    );
+    assert!(body.contains("\"usage\""), "client gets the JSON body; body: {body}");
+
+    // The upstream WAS reached (proving no pre-forward block), the key was
+    // injected, and the response usage (7, 9) accumulated ON TOP of the prior
+    // (40, 20) → (47, 29).
+    assert!(served.load(Ordering::SeqCst), "meter-only request must reach upstream");
+    let g = seen.lock().unwrap();
+    assert_eq!(g.api_key.as_deref(), Some("sk-test"));
+    drop(g);
+    assert_eq!(ledger.spent("task-meter"), (47, 29));
+}
+
+// Regression guard for the GATED gate (`X-Maestro-Task`, the implementer): a task
+// already over its ceiling is rejected 429 budget_exhausted WITHOUT forwarding
+// upstream. Complements `over_budget_rejected_before_forwarding`; here the mock
+// upstream would return 200 with usage if reached, so the (0,0)-vs-forwarded
+// distinction proves the request never left the proxy.
+#[test]
+fn gated_over_budget_rejected_429() {
+    let (upstream, _seen, served) = start_mock_upstream(false);
+    let ledger = Arc::new(Ledger::new());
+    ledger.register("task-gated", Some(50));
+    ledger.add_usage("task-gated", 40, 20); // 60 >= 50 → over budget
+    assert!(ledger.over_budget("task-gated"));
+
+    let (proxy_addr, _h) = maestro_proxy::spawn(
+        "127.0.0.1:0",
+        cfg(&upstream),
+        Arc::clone(&ledger),
+        key_provider("sk-test"),
+    )
+    .unwrap();
+
+    let (status, body) = post_through_proxy(
+        &proxy_addr.to_string(),
+        r#"{"stream":false}"#,
+        Some("task-gated"),
+    );
+    assert_eq!(status, 429, "over-budget gated task must be 429; body: {body}");
+    assert!(
+        body.contains("budget_exhausted"),
+        "429 body carries budget_exhausted; body: {body}"
+    );
+
+    // Upstream never reached; the ledger is untouched by the blocked request.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        !served.load(Ordering::SeqCst),
+        "a gated over-budget request must NOT be forwarded upstream"
+    );
+    assert_eq!(ledger.spent("task-gated"), (40, 20));
 }
