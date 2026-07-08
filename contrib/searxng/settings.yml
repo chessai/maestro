@@ -1,0 +1,32 @@
+# Minimal SearXNG settings for maestro (ADR-005).
+#
+# The one setting that MATTERS for maestro: `search.formats` must include
+# `json`. SearXNG disables the JSON API by default; maestro's SearxngBackend
+# calls `{endpoint}/search?q=...&format=json` and parses `results[].{url,title,
+# content}`, so without `json` in the formats list every search returns 403.
+#
+# Replace `ultrasecret-change-me` with a random secret (e.g. `openssl rand -hex 32`).
+
+use_default_settings: true
+
+server:
+  secret_key: "ultrasecret-change-me"
+  limiter: false          # no rate limiting for a single-user local instance
+  image_proxy: false
+
+search:
+  # REQUIRED by maestro — enables the JSON API the daemon consumes.
+  formats:
+    - html
+    - json
+  autocomplete: ""
+  safe_search: 0
+
+# Trim to a few reliable general engines; add/remove as you like.
+engines:
+  - name: duckduckgo
+    disabled: false
+  - name: google
+    disabled: false
+  - name: brave
+    disabled: false
