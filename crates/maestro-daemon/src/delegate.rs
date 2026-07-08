@@ -251,7 +251,7 @@ fn resolved_profile(profile_flag: Option<&str>) -> Result<ResolvedProfile, Strin
 
 /// A fully resolved role for a tier: the model plus its backend selectors
 /// (`kind` + `base_url`), carried from config through to the worker (ADR-008).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedRole {
     pub model: String,
     pub kind: Option<String>,
@@ -263,6 +263,10 @@ pub struct ResolvedRole {
     /// Adapter selector for a `driven_cli` role: `"generic"` (default / unset)
     /// or `"claude"` for the two-phase permission-mode adapter.
     pub adapter: Option<String>,
+    /// Dollar cap for `claude --max-budget-usd <amount>` (ADR-006). When set,
+    /// the role is API-billed; provider API keys are NOT stripped so the CLI
+    /// can authenticate per-token. `None` → subscription (keys stripped).
+    pub max_budget_usd: Option<f64>,
 }
 
 /// The configured role for a tier off a resolved profile, if present. A bare
@@ -281,6 +285,7 @@ fn role_for_tier(rp: &ResolvedProfile, tier: Tier) -> Option<ResolvedRole> {
             command: None,
             args: None,
             adapter: None,
+            max_budget_usd: None,
         },
         RoleModel::Detailed(t) => ResolvedRole {
             model: t.model.clone(),
@@ -289,6 +294,7 @@ fn role_for_tier(rp: &ResolvedProfile, tier: Tier) -> Option<ResolvedRole> {
             command: t.command.clone(),
             args: t.args.clone(),
             adapter: t.adapter.clone(),
+            max_budget_usd: t.max_budget_usd,
         },
     })
 }
@@ -495,6 +501,7 @@ fn verifier_role(rp: &ResolvedProfile) -> Option<ResolvedRole> {
             command: None,
             args: None,
             adapter: None,
+            max_budget_usd: None,
         },
         RoleModel::Detailed(t) => ResolvedRole {
             model: t.model.clone(),
@@ -503,6 +510,7 @@ fn verifier_role(rp: &ResolvedProfile) -> Option<ResolvedRole> {
             command: t.command.clone(),
             args: t.args.clone(),
             adapter: t.adapter.clone(),
+            max_budget_usd: t.max_budget_usd,
         },
     })
 }
@@ -1354,6 +1362,29 @@ fn driven_prompt(spec: &TaskSpec) -> String {
     )
 }
 
+/// The env-var names to strip from a driven CLI's inherited environment
+/// (ADR-006). When `max_budget_usd` is `Some` the role is API-billed
+/// (pay-per-token): the CLI needs the provider API key to authenticate and to
+/// have the dollar ceiling enforced — return an EMPTY strip list so the keys
+/// flow through to the child. When `None` the role is subscription-backed
+/// (flat-rate, unmetered): strip the standard provider API keys so a
+/// subscription-authenticated CLI (claude, codex) doesn't accidentally bill
+/// per-token via a key that happens to be in the daemon's environment.
+pub(crate) fn driven_env_remove(max_budget_usd: Option<f64>) -> Vec<String> {
+    if max_budget_usd.is_some() {
+        // API-billed: retain all provider keys.
+        vec![]
+    } else {
+        // Subscription: strip provider API keys.
+        vec![
+            "ANTHROPIC_API_KEY".into(),
+            "ANTHROPIC_AUTH_TOKEN".into(),
+            "OPENAI_API_KEY".into(),
+            "CODEX_API_KEY".into(),
+        ]
+    }
+}
+
 /// Run a single DRIVEN (PTY) attempt (ADR-006 / M3). Spawns the configured CLI
 /// over a PTY in a fresh worktree, runs the plan-echo gate, registers the live
 /// session for the kill path, joins to completion, then maps the [`EndReason`]:
@@ -1448,6 +1479,19 @@ fn run_driven_attempt(
     let turn_cap = effective_turn_cap(rp, recipe, role, spec);
 
     let watchdog = watchdog_duration(rp);
+
+    // API-billed: when max_budget_usd is set, keep provider API keys so the
+    // CLI can authenticate per-token and self-enforce the cap. Subscription
+    // (None): strip the keys so the flat-rate CLI uses its subscription.
+    if let Some(cap) = role.max_budget_usd {
+        tracing::info!(
+            task = %task_id,
+            attempt,
+            max_budget_usd = cap,
+            "driven role is API-billed: provider API keys retained, CLI will enforce dollar cap"
+        );
+    }
+
     let config = DrivenConfig {
         program,
         args,
@@ -1459,18 +1503,15 @@ fn run_driven_attempt(
         // Give the plan echo a little slack over the watchdog.
         plan_timeout: watchdog,
         turn_cap: Some(turn_cap),
-        // Strip provider API keys so a subscription-authenticated CLI
-        // (claude, codex) uses its subscription (flat-rate) instead of
-        // accidentally billing per-token via a key in the daemon's env
-        // (ADR-006 `metered: false`). The daemon's own in-process calls
-        // (plan checker, shim extraction, one-shot API backends) are NOT
-        // affected — only the child process's inherited env is modified.
-        env_remove: vec![
-            "ANTHROPIC_API_KEY".into(),
-            "ANTHROPIC_AUTH_TOKEN".into(),
-            "OPENAI_API_KEY".into(),
-            "CODEX_API_KEY".into(),
-        ],
+        max_budget_usd: role.max_budget_usd,
+        // Strip provider API keys for subscription-authenticated CLIs (flat-
+        // rate, unmetered). When max_budget_usd is set the role is API-billed
+        // (pay-per-token): retain the keys so the CLI can authenticate and
+        // self-enforce the dollar ceiling (ADR-006 `metered: true`). The
+        // daemon's own in-process calls (plan checker, shim extraction,
+        // one-shot API backends) are NOT affected — only the child's
+        // inherited env is modified.
+        env_remove: driven_env_remove(role.max_budget_usd),
     };
 
     emit(state, task_id, EventKind::Iterating, None);
@@ -2250,6 +2291,7 @@ roles.tier1 = { model = "qwen", kind = "openai_compat", base_url = "http://local
             command: None,
             args: None,
             adapter: None,
+            max_budget_usd: None,
         }
     }
 
@@ -2323,6 +2365,30 @@ roles.tier1 = { model = "qwen", kind = "openai_compat", base_url = "http://local
         let mut s = spec(vec![crit("AC1", "cargo test", CriterionKind::Command)]);
         s.budget.turns = turns;
         s
+    }
+
+    // driven_env_remove: Some → empty (API-billed, keep keys); None → 4-key strip list.
+    #[test]
+    fn driven_env_remove_api_billed_vs_subscription() {
+        // API-billed (max_budget_usd set): no keys stripped.
+        let api_billed = driven_env_remove(Some(5.0));
+        assert!(
+            api_billed.is_empty(),
+            "API-billed role must NOT strip provider keys; got: {api_billed:?}"
+        );
+
+        // Subscription (max_budget_usd not set): strip the standard 4 keys.
+        let subscription = driven_env_remove(None);
+        assert_eq!(
+            subscription,
+            vec![
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "OPENAI_API_KEY",
+                "CODEX_API_KEY",
+            ],
+            "subscription role must strip provider API keys"
+        );
     }
 
     // ADR-004 / ADR-007: effective_turn_cap — the enforced per-attempt turn cap

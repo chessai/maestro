@@ -135,6 +135,7 @@ pub fn run_claude_driven(
             &log_path,
             config.watchdog,
             None,
+            config.max_budget_usd,
             &kill_rx,
             &pid_slot,
             &config.env_remove,
@@ -199,6 +200,7 @@ pub fn run_claude_driven(
                     &log_path,
                     config.watchdog,
                     config.turn_cap,
+                    config.max_budget_usd,
                     &kill_rx,
                     &pid_slot,
                     &config.env_remove,
@@ -273,6 +275,32 @@ fn sum_opt_f(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     }
 }
 
+/// Build the argv for a single stream-json phase. Pure function (no I/O), split
+/// out so tests can assert on the constructed argv without spawning a process.
+///
+/// `argv = base_args + ["--output-format","stream-json","--verbose","--permission-mode",mode]
+///   [+ ["--max-budget-usd","<amount>"] when max_budget_usd is Some] + [prompt]`
+pub fn json_phase_args(
+    base_args: &[String],
+    mode: &str,
+    prompt: &str,
+    max_budget_usd: Option<f64>,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(base_args.len() + 8);
+    args.extend(base_args.iter().cloned());
+    args.push("--output-format".to_string());
+    args.push("stream-json".to_string());
+    args.push("--verbose".to_string());
+    args.push("--permission-mode".to_string());
+    args.push(mode.to_string());
+    if let Some(budget) = max_budget_usd {
+        args.push("--max-budget-usd".to_string());
+        args.push(format!("{budget}"));
+    }
+    args.push(prompt.to_string());
+    args
+}
+
 /// Run ONE `claude --print --output-format stream-json --verbose
 /// --permission-mode <mode> <prompt>` phase over a PTY, parsing the newline-
 /// delimited JSON as it streams, and return the terminal kind + captured plan
@@ -292,19 +320,12 @@ fn run_json_phase(
     log_path: &Path,
     watchdog: Duration,
     turn_cap: Option<u32>,
+    max_budget_usd: Option<f64>,
     kill_rx: &Receiver<KillKind>,
     pid_slot: &Arc<Mutex<Option<i32>>>,
     env_remove: &[String],
 ) -> JsonPhaseOutcome {
-    // argv = base_args + stream-json flags + mode + prompt (prompt LAST, as arg).
-    let mut args = Vec::with_capacity(base_args.len() + 6);
-    args.extend(base_args.iter().cloned());
-    args.push("--output-format".to_string());
-    args.push("stream-json".to_string());
-    args.push("--verbose".to_string());
-    args.push("--permission-mode".to_string());
-    args.push(mode.to_string());
-    args.push(prompt.to_string());
+    let args = json_phase_args(base_args, mode, prompt, max_budget_usd);
 
     let mut pty = match PtyChild::spawn(program, &args, cwd, log_path, env_remove) {
         Ok(p) => p,

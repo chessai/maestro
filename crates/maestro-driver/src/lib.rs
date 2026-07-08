@@ -21,7 +21,7 @@ mod session;
 pub use checker::{
     build_plan_check_body, AnthropicPlanChecker, MockPlanChecker, PlanChecker, PlanVerdict,
 };
-pub use claude::run_claude_driven;
+pub use claude::{json_phase_args, run_claude_driven};
 pub use session::{
     pid_alive, DrivenConfig, DrivenResult, DrivenSession, EndReason, KillKind, SessionHandle,
 };

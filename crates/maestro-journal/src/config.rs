@@ -256,7 +256,7 @@ impl Default for Defaults {
 
 /// A role model config (ADR-007). A tier may be a bare model string or a table
 /// `{ model, kind, turn_budget }`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RoleModel {
     /// Bare model string, e.g. `"claude-sonnet-4-6"`.
@@ -276,7 +276,7 @@ impl RoleModel {
 }
 
 /// The table form of a role model (ADR-007).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoleModelTable {
     pub model: String,
     /// e.g. `driven_cli`.
@@ -302,10 +302,17 @@ pub struct RoleModelTable {
     pub adapter: Option<String>,
     #[serde(default)]
     pub turn_budget: Option<i64>,
+    /// Dollar cap passed to `claude --max-budget-usd <amount>` (ADR-006). When
+    /// set, the driven role is API-billed (pay-per-token) and the CLI enforces
+    /// the ceiling itself; the daemon must NOT strip provider API keys on this
+    /// path so the CLI can authenticate per-token. `None` → subscription mode
+    /// (keys stripped, flat-rate).
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
 }
 
 /// The `roles.*` table for a profile (ADR-007).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Roles {
     #[serde(default)]
     pub tier0: Option<RoleModel>,
@@ -589,6 +596,28 @@ proxy.addr = "127.0.0.1:8787"
         let cfg3 = Config::from_toml_str(toml3).expect("config parses");
         assert!(cfg3.defaults.proxy.enabled);
         assert_eq!(cfg3.defaults.proxy.addr, "127.0.0.1:9999");
+    }
+
+    // A role table with max_budget_usd parses with the dollar cap set.
+    #[test]
+    fn role_table_with_max_budget_usd_parses() {
+        let toml = r#"
+[defaults]
+[profiles.personal]
+roles.tier0 = { model = "claude", kind = "driven_cli", command = "claude", adapter = "claude", max_budget_usd = 5.0 }
+"#;
+        let cfg = Config::from_toml_str(toml).expect("config parses");
+        let p = cfg.profiles.get("personal").expect("personal profile");
+        match p.roles.tier0.as_ref().expect("tier0 set") {
+            RoleModel::Detailed(t) => {
+                assert_eq!(t.model, "claude");
+                assert_eq!(t.kind.as_deref(), Some("driven_cli"));
+                assert_eq!(t.command.as_deref(), Some("claude"));
+                assert_eq!(t.adapter.as_deref(), Some("claude"));
+                assert_eq!(t.max_budget_usd, Some(5.0));
+            }
+            other => panic!("tier0 should be a Detailed table, got {other:?}"),
+        }
     }
 
     // A bare-string role stays RoleModel::Bare (⇒ default anthropic backend,

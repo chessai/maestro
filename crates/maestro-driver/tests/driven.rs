@@ -121,6 +121,7 @@ fn config(f: &Fixture, scenario: &str, watchdog: Duration) -> DrivenConfig {
         plan_timeout: Duration::from_secs(10),
         env_remove: vec![],
         turn_cap: None,
+        max_budget_usd: None,
     }
 }
 
@@ -301,6 +302,7 @@ exit 0
         plan_timeout: Duration::from_secs(10),
         env_remove: vec![TEST_VAR.to_string()],
         turn_cap: None,
+        max_budget_usd: None,
     };
 
     let (_handle, join) =

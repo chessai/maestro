@@ -354,6 +354,7 @@ mod tests {
             args: None,
             adapter: None,
             turn_budget: None,
+            max_budget_usd: None,
         })
     }
 

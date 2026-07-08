@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maestro_driver::{
-    pid_alive, run_claude_driven, DrivenConfig, EndReason, KillKind, MockPlanChecker,
+    json_phase_args, pid_alive, run_claude_driven, DrivenConfig, EndReason, KillKind,
+    MockPlanChecker,
 };
 use maestro_journal::domain::Tier;
 use maestro_journal::spec::{AcceptanceCriterion, Budget, CriterionKind, TaskSpec};
@@ -190,6 +191,7 @@ fn config(f: &Fixture, scenario: &str, watchdog: Duration, turn_cap: Option<u32>
         plan_timeout: Duration::from_secs(10),
         env_remove: vec![],
         turn_cap,
+        max_budget_usd: None,
     }
 }
 
@@ -358,4 +360,50 @@ fn kill_tears_down_running_phase_two() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `json_phase_args` with `max_budget_usd = Some(5.0)` inserts
+/// `--max-budget-usd 5` immediately before the prompt (last arg).
+#[test]
+fn json_phase_args_includes_max_budget_usd_when_set() {
+    let base: Vec<String> = vec!["--print".into()];
+    let args = json_phase_args(&base, "plan", "do the thing", Some(5.0));
+
+    // The argv must contain --max-budget-usd followed by the formatted amount.
+    let pos = args
+        .iter()
+        .position(|a| a == "--max-budget-usd")
+        .expect("--max-budget-usd must be present when max_budget_usd is Some");
+    assert_eq!(
+        args.get(pos + 1).map(|s| s.as_str()),
+        Some("5"),
+        "--max-budget-usd value must be '5'"
+    );
+
+    // The prompt must still be the last argument.
+    assert_eq!(
+        args.last().map(|s| s.as_str()),
+        Some("do the thing"),
+        "prompt must remain the last argument"
+    );
+}
+
+/// `json_phase_args` with `max_budget_usd = None` must NOT contain
+/// `--max-budget-usd` anywhere in the argv.
+#[test]
+fn json_phase_args_omits_max_budget_usd_when_none() {
+    let base: Vec<String> = vec!["--print".into()];
+    let args = json_phase_args(&base, "acceptEdits", "do the thing", None);
+
+    assert!(
+        !args.iter().any(|a| a == "--max-budget-usd"),
+        "--max-budget-usd must NOT appear when max_budget_usd is None; got: {args:?}"
+    );
+
+    // The prompt must still be the last argument.
+    assert_eq!(
+        args.last().map(|s| s.as_str()),
+        Some("do the thing"),
+        "prompt must remain the last argument"
+    );
 }

@@ -109,6 +109,12 @@ pub struct DrivenConfig {
     /// observed assistant-turn count exceeds this cap. `None` = no cap. The
     /// generic [`DrivenSession`] path ignores this field.
     pub turn_cap: Option<u32>,
+    /// Dollar cap passed as `--max-budget-usd <amount>` to the `claude` CLI
+    /// (ADR-006). When set, the role is API-billed; provider API keys must NOT
+    /// be stripped so the CLI can authenticate per-token and self-enforce the
+    /// ceiling. `None` → subscription mode (keys stripped by the daemon).
+    /// The generic [`DrivenSession`] path ignores this field.
+    pub max_budget_usd: Option<f64>,
 }
 
 /// Bound on plan-echo lines read after the marker line.
