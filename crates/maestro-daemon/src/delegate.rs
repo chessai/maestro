@@ -1,0 +1,1791 @@
+//! The one-shot delegation pipeline (M1, ADR-003 / ADR-002 / ADR-006).
+//!
+//! On `Request::Delegate` the daemon:
+//!   1. validates the spec (falsifiable acceptance criteria; resolvable model);
+//!   2. creates the task row and emits `created`;
+//!   3. spawns a background worker thread that: creates a worktree, records an
+//!      implementer session, runs the implementer backend, then runs the
+//!      mechanical gate, journaling each lifecycle transition.
+//!
+//! `delegate` returns the `task_id` immediately; the advisor observes progress
+//! via `task_status` / the inbox. A machine-wide concurrency cap gates how many
+//! workers run at once; over-cap tasks emit `queued` and start when a slot frees.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+use maestro_journal::config::{Config, RoleModel};
+use maestro_journal::domain::{
+    ContainmentLevel, EventKind, ExitStatus, Independence, Role, SessionKind, Tier,
+};
+use maestro_journal::paths;
+use maestro_journal::report::{ReportBody, Verdict};
+use maestro_journal::spec::{CriterionKind, TaskSpec};
+use maestro_journal::Journal;
+use maestro_implementer::{
+    AnthropicBackend, AnthropicVerifier, ImplementerBackend, ImplementerError, ImplementerTask,
+    MockBackend, MockVerifier, VerifierBackend, VerifyTask,
+};
+use maestro_driver::{
+    AnthropicPlanChecker, DrivenConfig, DrivenSession, EndReason, KillKind, MockPlanChecker,
+    PlanChecker,
+};
+
+use crate::gate::{self, GateOutcome};
+use crate::resolve::{resolve, ResolvedProfile};
+use crate::worktree;
+
+/// Shared, process-wide delegation state: the single journal writer behind a
+/// mutex, plus the machine-concurrency semaphore. Cloned (via `Arc`) into every
+/// worker thread.
+pub struct DelegationState {
+    /// The single SQLite connection, shared read+write under a mutex.
+    pub journal: Arc<Mutex<Journal>>,
+    /// Machine concurrency limiter (ADR-003 `concurrency.machine_cap`).
+    slots: Mutex<Slots>,
+    slot_cv: Condvar,
+    /// The daemon's `--profile` flag, so workers resolve tier→model identically.
+    profile_flag: Option<String>,
+    /// The host capability probe (ADR-004), cached once at startup — it is cheap
+    /// but a subprocess call, so we do not re-probe per delegation.
+    caps: maestro_sandbox::Capabilities,
+    /// Live driven (PTY) sessions keyed by `task_id` (ADR-006). A driven worker
+    /// registers its [`maestro_driver::SessionHandle`] before joining the driver
+    /// and removes it after; `KillTask` looks the handle up to fire the
+    /// break-glass kill path. Empty for tasks not running a driven session.
+    live_sessions: Mutex<HashMap<String, maestro_driver::SessionHandle>>,
+}
+
+struct Slots {
+    in_use: u32,
+    cap: u32,
+}
+
+impl DelegationState {
+    /// Build shared state from the opened journal and the resolved machine cap.
+    pub fn new(journal: Journal, machine_cap: u32, profile_flag: Option<String>) -> Arc<Self> {
+        Arc::new(DelegationState {
+            journal: Arc::new(Mutex::new(journal)),
+            slots: Mutex::new(Slots {
+                in_use: 0,
+                cap: machine_cap.max(1),
+            }),
+            slot_cv: Condvar::new(),
+            profile_flag,
+            caps: maestro_sandbox::probe(),
+            live_sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Register a live driven session's handle under its `task_id` (ADR-006), so
+    /// `KillTask` can reach it. Called by the driven worker before it joins.
+    pub fn register_session(&self, task_id: &str, handle: maestro_driver::SessionHandle) {
+        self.live_sessions
+            .lock()
+            .expect("live_sessions mutex poisoned")
+            .insert(task_id.to_string(), handle);
+    }
+
+    /// Remove a task's live driven session handle (called after the driver
+    /// returns, whatever the outcome).
+    pub fn unregister_session(&self, task_id: &str) {
+        self.live_sessions
+            .lock()
+            .expect("live_sessions mutex poisoned")
+            .remove(task_id);
+    }
+
+    /// Fetch a clone of a task's live driven session handle, if one is running.
+    pub fn session_handle(&self, task_id: &str) -> Option<maestro_driver::SessionHandle> {
+        self.live_sessions
+            .lock()
+            .expect("live_sessions mutex poisoned")
+            .get(task_id)
+            .cloned()
+    }
+
+    /// Try to take a concurrency slot without blocking. Returns `true` on
+    /// success (caller must later call [`Self::release_slot`]).
+    fn try_take_slot(&self) -> bool {
+        let mut slots = self.slots.lock().expect("slots mutex poisoned");
+        if slots.in_use < slots.cap {
+            slots.in_use += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Block until a slot is free, then take it.
+    fn take_slot_blocking(&self) {
+        let mut slots = self.slots.lock().expect("slots mutex poisoned");
+        while slots.in_use >= slots.cap {
+            slots = self.slot_cv.wait(slots).expect("slot cv wait");
+        }
+        slots.in_use += 1;
+    }
+
+    /// Release a previously-taken slot and wake one waiter.
+    fn release_slot(&self) {
+        let mut slots = self.slots.lock().expect("slots mutex poisoned");
+        slots.in_use = slots.in_use.saturating_sub(1);
+        self.slot_cv.notify_one();
+    }
+}
+
+/// A validation failure detected before (or at) task creation.
+pub enum DelegateError {
+    /// The spec failed validation; `reason` is a human message. Mapped to a
+    /// terminal `failed(spec_rejected)` if a task was created, else returned raw.
+    SpecRejected(String),
+    /// The tier's model could not be resolved from the active profile.
+    ModelUnavailable(String),
+    /// An internal fault (journal write, config load).
+    Internal(String),
+}
+
+impl DelegateError {
+    /// The failure-taxonomy kind string for the journal payload.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            DelegateError::SpecRejected(_) => "spec_rejected",
+            DelegateError::ModelUnavailable(_) => "model_unavailable",
+            DelegateError::Internal(_) => "internal_error",
+        }
+    }
+
+    /// The human message, safe to surface to the caller.
+    pub fn message_public(&self) -> &str {
+        match self {
+            DelegateError::SpecRejected(m)
+            | DelegateError::ModelUnavailable(m)
+            | DelegateError::Internal(m) => m,
+        }
+    }
+}
+
+/// Record a terminal task for a pre-spawn delegation rejection so the lifecycle
+/// is observable via `task_status` / the inbox. Creates a task row with a
+/// synthetic minimal spec (we may not have a resolvable model, so the row is
+/// best-effort), emits `created` then `failed(<kind>)`, and returns the task id.
+///
+/// Returns `None` if even the task row could not be written, in which case the
+/// caller surfaces a plain error response.
+pub fn record_rejected_task(
+    state: &DelegationState,
+    advisor_session_id: &str,
+    err: &DelegateError,
+) -> Option<String> {
+    // A placeholder spec/tier so the row is well-formed; the failure payload
+    // carries the real reason.
+    let spec_json = serde_json::json!({ "title": "(rejected)" }).to_string();
+    let task_id = {
+        let journal = state.journal.lock().expect("journal mutex poisoned");
+        journal
+            .create_task(
+                advisor_session_id,
+                Tier::T0,
+                "unknown",
+                ContainmentLevel::L0,
+                &spec_json,
+                "HEAD",
+                None,
+                None,
+            )
+            .ok()?
+    };
+    emit(state, &task_id, EventKind::Created, None);
+    let payload = failure_payload(err.kind_str(), err.message_public(), None);
+    emit(state, &task_id, EventKind::Failed, Some(&payload));
+    Some(task_id)
+}
+
+/// Load the on-disk config (defaults on any read/parse failure — the daemon must
+/// keep serving). Mirrors the daemon's `load_config`.
+fn load_config() -> Config {
+    let path = maestro_journal::paths::config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Config::from_toml_str(&s).unwrap_or_default(),
+        Err(_) => Config::default(),
+    }
+}
+
+/// Resolve the active profile using the daemon flag + `MAESTRO_PROFILE`.
+fn resolved_profile(profile_flag: Option<&str>) -> Result<ResolvedProfile, String> {
+    let config = load_config();
+    let env = std::env::var("MAESTRO_PROFILE").ok();
+    resolve(profile_flag, env.as_deref(), &config).resolved
+}
+
+/// A fully resolved role for a tier: the model plus its backend selectors
+/// (`kind` + `base_url`), carried from config through to the worker (ADR-008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRole {
+    pub model: String,
+    pub kind: Option<String>,
+    pub base_url: Option<String>,
+    /// For a `driven_cli` role (ADR-006 / M3): the CLI program to spawn.
+    pub command: Option<String>,
+    /// Arguments passed to `command`.
+    pub args: Option<Vec<String>>,
+    /// Adapter selector for a `driven_cli` role: `"generic"` (default / unset)
+    /// or `"claude"` for the two-phase permission-mode adapter.
+    pub adapter: Option<String>,
+}
+
+/// The configured role for a tier off a resolved profile, if present. A bare
+/// model string carries no `kind`/`base_url` (⇒ default anthropic backend).
+fn role_for_tier(rp: &ResolvedProfile, tier: Tier) -> Option<ResolvedRole> {
+    let role = match tier {
+        Tier::T0 => rp.roles.tier0.as_ref(),
+        Tier::T1 => rp.roles.tier1.as_ref(),
+        Tier::T2 => rp.roles.tier2.as_ref(),
+    }?;
+    Some(match role {
+        RoleModel::Bare(m) => ResolvedRole {
+            model: m.clone(),
+            kind: None,
+            base_url: None,
+            command: None,
+            args: None,
+            adapter: None,
+        },
+        RoleModel::Detailed(t) => ResolvedRole {
+            model: t.model.clone(),
+            kind: t.kind.clone(),
+            base_url: t.base_url.clone(),
+            command: t.command.clone(),
+            args: t.args.clone(),
+            adapter: t.adapter.clone(),
+        },
+    })
+}
+
+/// Select the implementer backend for a resolved role (ADR-008). Backend choice
+/// is a profile decision, never hardcoded: it is driven by the role's `kind`
+/// (and the `mock` model as a convenience). Unavailable/unknown kinds fail loud
+/// as `model_unavailable` — never a silent fallback to the API backend.
+pub fn select_backend(
+    model: &str,
+    kind: Option<&str>,
+    base_url: Option<String>,
+) -> Result<Box<dyn ImplementerBackend>, DelegateError> {
+    // A bare `mock` model or an explicit `mock` kind → the deterministic backend.
+    if model == "mock" || kind == Some("mock") {
+        return Ok(Box::new(MockBackend));
+    }
+    match kind {
+        None | Some("anthropic") => Ok(Box::new(AnthropicBackend::new(base_url))),
+        Some("driven_cli") => Err(DelegateError::ModelUnavailable(
+            "driven_cli backend is not available until M3".into(),
+        )),
+        Some("openai_compat") => Err(DelegateError::ModelUnavailable(
+            "openai_compat backend is not yet implemented (ADR-008)".into(),
+        )),
+        Some(other) => Err(DelegateError::ModelUnavailable(format!(
+            "unknown backend kind: {other}"
+        ))),
+    }
+}
+
+/// The containment floor for a tier off a resolved profile (0 if unset). The
+/// task's `containment_min` can only *raise* this (ADR-003 / ADR-004).
+fn containment_floor(rp: &ResolvedProfile, tier: Tier, spec_min: u8) -> u8 {
+    let profile_min = match tier {
+        Tier::T0 => rp.containment_min.tier0,
+        Tier::T1 => rp.containment_min.tier1,
+        Tier::T2 => rp.containment_min.tier2,
+    }
+    .unwrap_or(0);
+    profile_min.max(spec_min)
+}
+
+/// The fully-resolved containment recipe for a task (ADR-004). Computed ONCE at
+/// delegation time and reused for the whole task — escalation may raise the
+/// model but never lowers containment, so the effective level is fixed here.
+/// The per-attempt [`maestro_sandbox::SandboxSpec`] is built from this recipe
+/// plus the attempt's worktree (the workspace differs per attempt).
+#[derive(Debug, Clone)]
+pub struct ContainmentRecipe {
+    /// The effective (post-downgrade) level to run every surface at.
+    pub level: maestro_sandbox::Level,
+    /// The resolved OS-sandbox backend.
+    pub backend: maestro_sandbox::Backend,
+    /// Network egress policy from `containment.network`.
+    pub network: maestro_sandbox::NetworkPolicy,
+    /// L2 flake dir (the repo path).
+    pub flake_dir: PathBuf,
+    /// L2 devShell variant.
+    pub devshell_variant: Option<String>,
+    /// Podman image (required by the podman backend).
+    pub podman_image: Option<String>,
+    /// The requested floor before downgrade (for the downgrade event payload).
+    pub requested: maestro_sandbox::Level,
+    /// Whether the host forced a downgrade below `requested`.
+    pub downgraded: bool,
+}
+
+impl ContainmentRecipe {
+    /// Resolve the effective containment recipe (ADR-004): map the requested
+    /// floor to a `sandbox::Level`, resolve the backend from config + caps, then
+    /// compute the effective level + downgrade flag. Pure given its inputs.
+    pub fn resolve(
+        requested_floor: u8,
+        containment: &maestro_journal::config::ContainmentConfig,
+        caps: &maestro_sandbox::Capabilities,
+        repo: &Path,
+    ) -> Self {
+        // A floor >2 is clamped to L2 (the max level); u8→Level is total here.
+        let requested = maestro_sandbox::Level::from_u8(requested_floor.min(2))
+            .unwrap_or(maestro_sandbox::Level::L0);
+        let backend = maestro_sandbox::resolve_backend(&containment.backend, caps);
+        let (level, downgraded) =
+            maestro_sandbox::resolve_effective(requested, caps, backend);
+        let network = if containment.network == "allow" {
+            maestro_sandbox::NetworkPolicy::Allow
+        } else {
+            maestro_sandbox::NetworkPolicy::Deny
+        };
+        ContainmentRecipe {
+            level,
+            backend,
+            network,
+            flake_dir: repo.to_path_buf(),
+            devshell_variant: containment.devshell_variant.clone(),
+            podman_image: containment.podman_image.clone(),
+            requested,
+            downgraded,
+        }
+    }
+
+    /// Build the per-attempt [`maestro_sandbox::SandboxSpec`] for a worktree.
+    pub fn spec_for(&self, workspace: &Path) -> maestro_sandbox::SandboxSpec {
+        maestro_sandbox::SandboxSpec {
+            level: self.level,
+            backend: self.backend,
+            workspace: workspace.to_path_buf(),
+            network: self.network,
+            flake_dir: Some(self.flake_dir.clone()),
+            devshell_variant: self.devshell_variant.clone(),
+            podman_image: self.podman_image.clone(),
+        }
+    }
+
+    /// The `ContainmentDowngraded` event payload: `{ requested, actual, backend }`.
+    fn downgrade_payload(&self) -> String {
+        serde_json::json!({
+            "requested": self.requested.as_u8(),
+            "actual": self.level.as_u8(),
+            "backend": self.backend.to_string(),
+        })
+        .to_string()
+    }
+}
+
+/// The verifier role off a resolved profile: `roles.verifier_floor` if set.
+/// A bare model carries no kind/base_url.
+fn verifier_role(rp: &ResolvedProfile) -> Option<ResolvedRole> {
+    rp.roles.verifier_floor.as_ref().map(|role| match role {
+        RoleModel::Bare(m) => ResolvedRole {
+            model: m.clone(),
+            kind: None,
+            base_url: None,
+            command: None,
+            args: None,
+            adapter: None,
+        },
+        RoleModel::Detailed(t) => ResolvedRole {
+            model: t.model.clone(),
+            kind: t.kind.clone(),
+            base_url: t.base_url.clone(),
+            command: t.command.clone(),
+            args: t.args.clone(),
+            adapter: t.adapter.clone(),
+        },
+    })
+}
+
+/// The provider prefix of a model id, for independence classification. We take
+/// the segment before the first `-` (e.g. `claude-opus-4-8` → `claude`,
+/// `gpt-5` → `gpt`, `mock` → `mock`). Good enough for the ADR-002 hierarchy.
+fn provider_prefix(model: &str) -> &str {
+    model.split('-').next().unwrap_or(model)
+}
+
+/// Classify verifier independence vs the implementer model (ADR-002):
+/// same model → `FreshContextOnly`; same provider, different model →
+/// `CrossModel`; else `CrossProvider`.
+fn classify_independence(implementer_model: &str, verifier_model: &str) -> Independence {
+    if implementer_model == verifier_model {
+        Independence::FreshContextOnly
+    } else if provider_prefix(implementer_model) == provider_prefix(verifier_model) {
+        Independence::CrossModel
+    } else {
+        Independence::CrossProvider
+    }
+}
+
+/// Choose the verifier for an attempt at `impl_tier` running `impl_model`
+/// (ADR-002). Prefer `roles.verifier_floor`; else fall back to a configured tier
+/// model that DIFFERS from the implementer. Returns the verifier role and its
+/// classified independence, or `None` when no usable verifier exists at all
+/// (→ the task fails `model_unavailable`; verification is never skipped).
+fn select_verifier(rp: &ResolvedProfile, impl_model: &str) -> Option<(ResolvedRole, Independence)> {
+    // 1. verifier_floor if configured (used even if it equals the implementer —
+    //    that is FreshContextOnly, still allowed as a last resort).
+    if let Some(role) = verifier_role(rp) {
+        let indep = classify_independence(impl_model, &role.model);
+        return Some((role, indep));
+    }
+    // 2. Fall back to a tier model DIFFERENT from the implementer.
+    for tier in [Tier::T0, Tier::T1, Tier::T2] {
+        if let Some(role) = role_for_tier(rp, tier) {
+            if role.model != impl_model {
+                let indep = classify_independence(impl_model, &role.model);
+                return Some((role, indep));
+            }
+        }
+    }
+    // 3. No differing model; as a last resort, any configured tier model at all
+    //    (fresh context only). If none configured, no verifier exists.
+    for tier in [Tier::T0, Tier::T1, Tier::T2] {
+        if let Some(role) = role_for_tier(rp, tier) {
+            let indep = classify_independence(impl_model, &role.model);
+            return Some((role, indep));
+        }
+    }
+    None
+}
+
+/// Select the verifier backend for a resolved verifier role: `mock` → the
+/// deterministic [`MockVerifier`], else the [`AnthropicVerifier`].
+fn select_verifier_backend(role: &ResolvedRole) -> Box<dyn VerifierBackend> {
+    if role.model == "mock" || role.kind.as_deref() == Some("mock") {
+        Box::new(MockVerifier)
+    } else {
+        Box::new(AnthropicVerifier::new(role.base_url.clone()))
+    }
+}
+
+/// The highest configured tier at or above `from`, i.e. the escalation ladder's
+/// "top". A tier is "configured" iff `role_for_tier` resolves a model for it.
+/// The ladder always includes `from` itself (its model was resolved at delegate
+/// time), so the result is never below `from`.
+fn top_tier(rp: &ResolvedProfile, from: Tier) -> Tier {
+    let mut top = from;
+    for tier in [Tier::T0, Tier::T1, Tier::T2] {
+        if tier > from && role_for_tier(rp, tier).is_some() {
+            top = tier;
+        }
+    }
+    top
+}
+
+/// The next configured tier strictly above `tier`, if any (skips gaps).
+fn next_configured_tier(rp: &ResolvedProfile, tier: Tier) -> Option<Tier> {
+    [Tier::T1, Tier::T2]
+        .into_iter()
+        .find(|&candidate| candidate > tier && role_for_tier(rp, candidate).is_some())
+}
+
+/// Validate a spec's acceptance criteria (ADR-003): every criterion must be a
+/// command or a falsifiable invariant with a non-empty `check`. Adjective-only
+/// or empty checks are rejected.
+fn validate_spec(spec: &TaskSpec) -> Result<(), String> {
+    if spec.acceptance_criteria.is_empty() {
+        return Err("spec has no acceptance criteria".to_string());
+    }
+    for c in &spec.acceptance_criteria {
+        if c.check.trim().is_empty() {
+            return Err(format!(
+                "acceptance criterion {} has an empty check (adjective-free, falsifiable checks required)",
+                c.id
+            ));
+        }
+        // Both Command and Invariant are acceptable *kinds*; the falsifiability
+        // guard is the non-empty check above. (M1 does not statically parse an
+        // invariant's semantics — only that it is a concrete statement.)
+        match c.kind {
+            CriterionKind::Command | CriterionKind::Invariant => {}
+        }
+    }
+    Ok(())
+}
+
+/// Append a task event under the shared journal lock. Errors are logged, not
+/// propagated, so the worker's own control flow stays linear.
+fn emit(state: &DelegationState, task_id: &str, kind: EventKind, payload: Option<&str>) {
+    let journal = state.journal.lock().expect("journal mutex poisoned");
+    if let Err(e) = journal.append_event(task_id, kind, payload) {
+        tracing::warn!(task = task_id, ?kind, error = %e, "append_event failed");
+    }
+}
+
+/// Record a session's outcome under the shared journal lock (ADR-008 metering
+/// write-back). A `None` session id (insert failed earlier) is a no-op. Errors
+/// are logged, not propagated, keeping the worker's control flow linear.
+fn finish_session(
+    state: &DelegationState,
+    session_id: Option<&str>,
+    exit_status: ExitStatus,
+    turns: Option<i64>,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    let journal = state.journal.lock().expect("journal mutex poisoned");
+    if let Err(e) = journal.finish_session(session_id, exit_status, turns, tokens_in, tokens_out) {
+        tracing::warn!(session = session_id, error = %e, "finish_session failed");
+    }
+}
+
+/// Entry point for `Request::Delegate`. Validates the spec, resolves the model,
+/// creates the task row, emits `created`, and spawns the background worker.
+/// Returns the new `task_id` on success.
+pub fn delegate(
+    state: &Arc<DelegationState>,
+    advisor_session_id: &str,
+    repo_path: &str,
+    spec: TaskSpec,
+) -> Result<String, DelegateError> {
+    // 1. Validate spec BEFORE any task row exists.
+    if let Err(reason) = validate_spec(&spec) {
+        return Err(DelegateError::SpecRejected(reason));
+    }
+
+    // Resolve tier → model and containment floor.
+    let rp = resolved_profile(state.profile_flag.as_deref())
+        .map_err(DelegateError::ModelUnavailable)?;
+    let tier = spec.tier;
+    let role = role_for_tier(&rp, tier).ok_or_else(|| {
+        DelegateError::ModelUnavailable(format!(
+            "no model configured for tier {} in the active profile",
+            tier.as_int()
+        ))
+    })?;
+    let model = role.model.clone();
+
+    // Resolve backend availability EARLY — before any task row / worktree —
+    // so an unavailable/unknown kind fails loud (`model_unavailable`) without
+    // spawning a worktree, mirroring the model-missing path above (ADR-008).
+    // The backend value itself is rebuilt in the worker; here we only validate.
+    // A `driven_cli` role uses the PTY path (not `select_backend`); it validates
+    // its `command` in the worker (`internal_error` if unset), so skip here.
+    if role.kind.as_deref() != Some("driven_cli") {
+        select_backend(&model, role.kind.as_deref(), role.base_url.clone())?;
+    }
+
+    // Resolve the EFFECTIVE containment recipe once (ADR-004): requested floor →
+    // host caps + backend → (effective level, downgraded?). Reused for the whole
+    // task so escalation never lowers containment.
+    let floor = containment_floor(&rp, tier, spec.containment_min);
+    let repo = PathBuf::from(repo_path);
+    let recipe = ContainmentRecipe::resolve(floor, &rp.containment, &state.caps, &repo);
+    // Record the ACTUAL effective level in `tasks.containment_level` (ADR-004
+    // downgrade-and-tighten), not the requested floor.
+    let containment = ContainmentLevel::try_from(recipe.level.as_u8())
+        .map_err(|e| DelegateError::Internal(format!("invalid containment level: {e}")))?;
+
+    let spec_json = serde_json::to_string(&spec)
+        .map_err(|e| DelegateError::Internal(format!("serializing spec: {e}")))?;
+    let base_ref = spec.base_ref.clone();
+
+    // The workspace path is fixed by convention: <state>/worktrees/<task_id>.
+    // We do not know the task_id until create_task mints it, so record the row
+    // first, then note the intended workspace via the worker.
+    let task_id = {
+        let journal = state.journal.lock().expect("journal mutex poisoned");
+        journal
+            .create_task(
+                advisor_session_id,
+                tier,
+                &model,
+                containment,
+                &spec_json,
+                &base_ref,
+                None,
+                None,
+            )
+            .map_err(|e| DelegateError::Internal(format!("create_task: {e}")))?
+    };
+
+    emit(state, &task_id, EventKind::Created, None);
+
+    // 3. Spawn the background worker.
+    let state = Arc::clone(state);
+    let tid = task_id.clone();
+    std::thread::spawn(move || {
+        run_worker(state, tid, repo, base_ref, spec, role, recipe);
+    });
+
+    Ok(task_id)
+}
+
+/// The background worker: acquire a slot (queueing if at cap), create the
+/// worktree, run the implementer, then the gate, journaling throughout.
+#[allow(clippy::too_many_arguments)]
+fn run_worker(
+    state: Arc<DelegationState>,
+    task_id: String,
+    repo: PathBuf,
+    base_ref: String,
+    spec: TaskSpec,
+    role: ResolvedRole,
+    recipe: ContainmentRecipe,
+) {
+    // Emit the containment-downgraded event BEFORE the first `spawned` (ADR-004),
+    // so the journal records the cap before any surface runs. Queueing may still
+    // delay the spawn, but the downgrade is task-scoped, not attempt-scoped.
+    if recipe.downgraded {
+        emit(
+            &state,
+            &task_id,
+            EventKind::ContainmentDowngraded,
+            Some(&recipe.downgrade_payload()),
+        );
+        // Light-touch tighten (ADR-004): shrink the per-attempt turn budget by the
+        // profile's `tighten.turn_factor`. Compute + log the tightened value here.
+        // NOTE (deferred): neither per-attempt turn-budget enforcement nor the
+        // allowlist tightening (`tighten.allowlist_factor`) is wired into the M3
+        // pipeline — the driven session carries a watchdog, not a turn cap, and
+        // the gate enforces the spec allowlist verbatim. Recording the tightened
+        // budget keeps the downgrade observable until that enforcement lands.
+        if let Some(turns) = spec.budget.turns {
+            let factor = resolved_profile(state.profile_flag.as_deref())
+                .map(|rp| rp.tighten.turn_factor)
+                .unwrap_or(0.6)
+                .clamp(0.0, 1.0);
+            let tightened = ((turns as f64) * factor).floor().max(1.0) as i64;
+            tracing::info!(
+                task = %task_id,
+                requested_turns = turns,
+                tightened_turns = tightened,
+                factor,
+                "containment downgraded: tightened per-attempt turn budget (enforcement deferred)"
+            );
+        }
+    }
+
+    // Concurrency: take a slot; if none free, emit `queued` and block.
+    if !state.try_take_slot() {
+        emit(&state, &task_id, EventKind::Queued, None);
+        state.take_slot_blocking();
+    }
+    // Ensure the slot is released no matter how the body exits.
+    struct SlotGuard<'a>(&'a DelegationState);
+    impl Drop for SlotGuard<'_> {
+        fn drop(&mut self) {
+            self.0.release_slot();
+        }
+    }
+    let _slot = SlotGuard(&state);
+
+    if let Err(fail) = run_pipeline(&state, &task_id, &repo, &base_ref, &spec, &role, &recipe) {
+        // Any pipeline error is journaled as a terminal `failed`.
+        let payload = failure_payload(fail.kind(), fail.message(), None);
+        emit(&state, &task_id, EventKind::Failed, Some(&payload));
+    }
+}
+
+/// A worker-internal failure with its taxonomy kind + message.
+struct WorkerFailure {
+    kind: &'static str,
+    message: String,
+}
+
+impl WorkerFailure {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+    fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+fn fail(kind: &'static str, message: impl Into<String>) -> WorkerFailure {
+    WorkerFailure {
+        kind,
+        message: message.into(),
+    }
+}
+
+/// Build the `failed`-event JSON payload mirroring the failure taxonomy.
+fn failure_payload(kind: &str, message: &str, extra: Option<serde_json::Value>) -> String {
+    let mut obj = serde_json::json!({ "kind": kind, "message": message });
+    if let (Some(map), Some(serde_json::Value::Object(extra))) = (obj.as_object_mut(), extra) {
+        for (k, v) in extra {
+            map.insert(k, v);
+        }
+    }
+    obj.to_string()
+}
+
+/// Check the task-lifetime ceilings (ADR-003) at an attempt boundary. If a
+/// ceiling is hit, emits a TERMINAL `failed(budget_exhausted)` and returns
+/// `true` (the caller stops the whole task — a budget stop is not escalation
+/// fuel). Returns `false` when the task is still within its budget.
+///
+/// Enforced at attempt boundaries (before each attempt and after each attempt's
+/// implementer+verifier have written their metered usage). NOTE: a true
+/// per-response / mid-stream token hard-stop needs the daemon API proxy
+/// (ADR-006) and is deferred; M6 enforces via reported usage at these boundaries.
+fn budget_exhausted(
+    state: &DelegationState,
+    task_id: &str,
+    token_ceiling: Option<i64>,
+    wall_clock_ceiling_minutes: Option<i64>,
+) -> bool {
+    // --- lifetime tokens: SUM over all sessions vs the ceiling ---------------
+    if let Some(ceiling) = token_ceiling {
+        let (tin, tout) = {
+            let journal = state.journal.lock().expect("journal mutex poisoned");
+            journal.task_token_totals(task_id).unwrap_or((0, 0))
+        };
+        if tin + tout >= ceiling {
+            let payload = failure_payload(
+                "budget_exhausted",
+                "task hit its lifetime token ceiling",
+                Some(serde_json::json!({
+                    "reason": "lifetime_tokens",
+                    "tokens_in": tin,
+                    "tokens_out": tout,
+                    "ceiling": ceiling,
+                })),
+            );
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            return true;
+        }
+    }
+
+    // --- lifetime wall-clock: minutes since the first `spawned` event --------
+    if let Some(minutes) = wall_clock_ceiling_minutes {
+        let first_spawn = {
+            let journal = state.journal.lock().expect("journal mutex poisoned");
+            journal.first_spawn_ts(task_id).unwrap_or(None)
+        };
+        // Only meaningful once a spawn has happened; before that, no elapsed clock.
+        if let Some(ts) = first_spawn {
+            if let Ok(spawned_at) =
+                time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339)
+            {
+                let elapsed = time::OffsetDateTime::now_utc() - spawned_at;
+                let elapsed_minutes = elapsed.whole_minutes();
+                if elapsed_minutes >= minutes {
+                    let payload = failure_payload(
+                        "budget_exhausted",
+                        "task hit its lifetime wall-clock ceiling",
+                        Some(serde_json::json!({
+                            "reason": "lifetime_wall_clock",
+                            "elapsed_minutes": elapsed_minutes,
+                            "ceiling_minutes": minutes,
+                        })),
+                    );
+                    emit(state, task_id, EventKind::Failed, Some(&payload));
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// The outcome of one implementer+gate+verify attempt, as it feeds the
+/// escalation control loop.
+enum AttemptOutcome {
+    /// The verifier passed: task is DONE (branch committed, journaled).
+    Passed,
+    /// A verification failure (checks_failed OR verify_failed) — escalation fuel.
+    /// Carries the failed diff + report (if a verifier ran) for the next attempt.
+    VerificationFailed {
+        diff: String,
+        report: Option<ReportBody>,
+    },
+    /// Terminal, NOT escalation fuel: scope violation (already journaled).
+    ScopeViolation,
+}
+
+/// The escalation control loop (ADR-003). Runs implementer→gate→verify attempts,
+/// escalating the tier on repeated verification failures and blocking at the top.
+///
+/// Ladder: from `spec.tier` up to the top configured tier. Two verification
+/// failures at a non-top tier → `escalated`, advance a tier. One failure at the
+/// top → `blocked`. Bounded: 2 attempts per non-top tier, 1 at the top.
+#[allow(clippy::too_many_arguments)]
+fn run_pipeline(
+    state: &DelegationState,
+    task_id: &str,
+    repo: &Path,
+    base_ref: &str,
+    spec: &TaskSpec,
+    initial_role: &ResolvedRole,
+    recipe: &ContainmentRecipe,
+) -> Result<(), WorkerFailure> {
+    // Resolve the profile once for verifier selection + the escalation ladder.
+    let rp = resolved_profile(state.profile_flag.as_deref())
+        .map_err(|e| fail("internal_error", format!("resolving profile: {e}")))?;
+
+    // Resolve the task-lifetime ceilings ONCE (ADR-003 "Task-lifetime ceilings").
+    // The per-attempt `budget` re-derives per tier; these bound the whole ladder.
+    // - token_ceiling: only the spec sets it (no invented default — a
+    //   config.lifetime.token_factor-derived default is a future refinement, and
+    //   inventing one here would break existing tests that set no token budget).
+    // - wall_clock_ceiling_minutes: the spec if set, else the profile/config
+    //   `lifetime.wall_clock_minutes` (default 30, large enough that fast tests
+    //   never trip it).
+    let token_ceiling: Option<i64> = spec.lifetime_budget.tokens;
+    let wall_clock_ceiling_minutes: Option<i64> = spec
+        .lifetime_budget
+        .wall_clock_minutes
+        .or(Some(rp.lifetime.wall_clock_minutes));
+
+    let start_tier = spec.tier;
+    let top = top_tier(&rp, start_tier);
+
+    let mut tier = start_tier;
+    let mut role = initial_role.clone();
+    // Per-tier verification-failure counter; reset on each escalation.
+    let mut tier_failures = 0u32;
+    // Whole-task, monotonically increasing verifier report attempt number.
+    let mut attempt: i64 = 0;
+    // All prior verifier reports + the last failed diff, carried into escalated
+    // attempts (never transcripts) (ADR-002 / ADR-003).
+    let mut prior_reports: Vec<ReportBody> = Vec::new();
+    let mut last_failed_diff: Option<String> = None;
+
+    loop {
+        // BEFORE each attempt: enforce the lifetime ceilings (ADR-003). A task
+        // that keeps failing verification is cut off here rather than running
+        // the full ladder. A budget stop is TERMINAL, not escalation fuel.
+        if budget_exhausted(state, task_id, token_ceiling, wall_clock_ceiling_minutes) {
+            return Ok(());
+        }
+
+        attempt += 1;
+        let outcome = run_attempt(
+            state,
+            task_id,
+            repo,
+            base_ref,
+            spec,
+            &role,
+            attempt,
+            &rp,
+            recipe,
+            &prior_reports,
+            last_failed_diff.as_deref(),
+        )?;
+
+        match outcome {
+            AttemptOutcome::Passed => return Ok(()),
+            AttemptOutcome::ScopeViolation => return Ok(()),
+            AttemptOutcome::VerificationFailed { diff, report } => {
+                // AFTER a failed attempt: the implementer + verifier sessions
+                // have written their metered tokens, so the accumulated total is
+                // now current. If a ceiling is hit, stop terminally BEFORE
+                // considering escalation (a budget stop is not escalation fuel).
+                // Only checked on the failure path: a Passed attempt already
+                // committed + emitted `verify_passed` and must not be overwritten.
+                if budget_exhausted(state, task_id, token_ceiling, wall_clock_ceiling_minutes) {
+                    return Ok(());
+                }
+                tier_failures += 1;
+                if let Some(r) = report {
+                    prior_reports.push(r);
+                }
+                last_failed_diff = Some(diff);
+
+                if tier == top {
+                    // One failure after reaching the top → blocked (resting).
+                    emit(state, task_id, EventKind::Blocked, None);
+                    return Ok(());
+                }
+                if tier_failures >= 2 {
+                    // Escalate: raise to the next configured tier (ADR-003).
+                    let Some(next) = next_configured_tier(&rp, tier) else {
+                        // No higher configured tier despite tier != top: treat
+                        // as blocked (defensive; top_tier should preclude this).
+                        emit(state, task_id, EventKind::Blocked, None);
+                        return Ok(());
+                    };
+                    let next_role = role_for_tier(&rp, next).ok_or_else(|| {
+                        fail(
+                            "model_unavailable",
+                            format!("no model configured for tier {} on escalation", next.as_int()),
+                        )
+                    })?;
+                    let payload = serde_json::json!({
+                        "from_tier": tier.as_int(),
+                        "to_tier": next.as_int(),
+                        "reason": "verification_failed",
+                    })
+                    .to_string();
+                    emit(state, task_id, EventKind::Escalated, Some(&payload));
+                    tier = next;
+                    role = next_role;
+                    tier_failures = 0;
+                    // Budgets re-derive from the new tier; containment is never
+                    // lowered (ADR-003) — M2 re-derives model here.
+                }
+                // else: 1st failure at a non-top tier → retry same tier.
+            }
+        }
+    }
+}
+
+/// Run a single attempt: fresh worktree, implementer, mechanical gate, and (on
+/// checks_passed) the model verifier. Journals each transition. Returns the
+/// attempt outcome; an `Err` is an infrastructure failure the caller journals as
+/// terminal `failed`.
+#[allow(clippy::too_many_arguments)]
+fn run_attempt(
+    state: &DelegationState,
+    task_id: &str,
+    repo: &Path,
+    base_ref: &str,
+    spec: &TaskSpec,
+    role: &ResolvedRole,
+    attempt: i64,
+    rp: &ResolvedProfile,
+    recipe: &ContainmentRecipe,
+    prior_reports: &[ReportBody],
+    last_failed_diff: Option<&str>,
+) -> Result<AttemptOutcome, WorkerFailure> {
+    let model = role.model.as_str();
+
+    // A `driven_cli` role runs a PTY session (ADR-006 / M3) instead of the
+    // one-shot API backend; the two share the mechanical gate + verifier tail.
+    if role.kind.as_deref() == Some("driven_cli") {
+        return run_driven_attempt(
+            state,
+            task_id,
+            repo,
+            base_ref,
+            spec,
+            role,
+            attempt,
+            rp,
+            recipe,
+            prior_reports,
+        );
+    }
+
+    // Select the backend up front (ADR-008). A kind that has become unavailable
+    // still fails loud.
+    let backend =
+        select_backend(model, role.kind.as_deref(), role.base_url.clone()).map_err(|e| {
+            fail("model_unavailable", e.message_public().to_string())
+        })?;
+
+    // --- create a FRESH worktree per attempt off base_ref ---------------
+    let worktree_path = worktree::create(repo, base_ref, task_id)
+        .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
+
+    let workspace = worktree_path.to_string_lossy().to_string();
+    emit(state, task_id, EventKind::Spawned, None);
+    let session_id = {
+        let journal = state.journal.lock().expect("journal mutex poisoned");
+        match journal.insert_session(
+            Some(task_id),
+            None,
+            Role::Implementer,
+            model,
+            SessionKind::OneShotApi,
+            Some(&workspace),
+        ) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!(task = task_id, error = %e, "insert_session failed");
+                None
+            }
+        }
+    };
+
+    // --- resolve house rules; escalated attempts prepend prior reports --
+    let mut house_rules = match &spec.house_rules_ref {
+        Some(rel) if !rel.trim().is_empty() => {
+            let path = repo.join(rel);
+            std::fs::read_to_string(&path).map_err(|e| {
+                fail(
+                    "internal_error",
+                    format!("reading house_rules_ref {}: {e}", path.display()),
+                )
+            })?
+        }
+        _ => String::new(),
+    };
+    if !prior_reports.is_empty() {
+        // Prepend a summary of ALL prior reports + the last failed diff. Never
+        // transcripts (ADR-002 / ADR-003).
+        let mut preamble = String::new();
+        preamble.push_str(
+            "## Prior attempt failed verification\n\
+             This task was re-run at a higher tier after verification failures. \
+             The summaries below are prior verifier reports (not transcripts). \
+             Address every blocker.\n\n",
+        );
+        for (i, r) in prior_reports.iter().enumerate() {
+            preamble.push_str(&format!("### Prior verifier report {}\n", i + 1));
+            preamble.push_str(&format!("verdict: {:?}\n", r.verdict));
+            for f in &r.findings {
+                preamble.push_str(&format!(
+                    "- {:?} [{}]: {}\n",
+                    f.severity,
+                    f.criterion_id.as_deref().unwrap_or("-"),
+                    f.evidence,
+                ));
+            }
+            preamble.push('\n');
+        }
+        if let Some(diff) = last_failed_diff {
+            preamble.push_str("### Last failed diff\n```diff\n");
+            preamble.push_str(diff);
+            preamble.push_str("\n```\n\n");
+        }
+        preamble.push_str(&house_rules);
+        house_rules = preamble;
+    }
+
+    // --- run the implementer backend ------------------------------------
+    emit(state, task_id, EventKind::Iterating, None);
+    let task = ImplementerTask {
+        spec: spec.clone(),
+        worktree: worktree_path.clone(),
+        house_rules,
+        model: model.to_string(),
+    };
+    match backend.run(&task) {
+        Ok(outcome) => {
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Ok,
+                Some(outcome.turns as i64),
+                Some(outcome.tokens_in as i64),
+                Some(outcome.tokens_out as i64),
+            );
+        }
+        Err(ImplementerError::Unavailable(m)) => {
+            finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
+            worktree::remove(repo, &worktree_path);
+            return Err(fail("model_unavailable", m));
+        }
+        Err(other) => {
+            finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
+            worktree::remove(repo, &worktree_path);
+            return Err(fail("internal_error", other.to_string()));
+        }
+    }
+    emit(state, task_id, EventKind::ImplFinished, None);
+
+    run_gate_and_verify(
+        state,
+        task_id,
+        base_ref,
+        spec,
+        role,
+        attempt,
+        rp,
+        recipe,
+        prior_reports,
+        &worktree_path,
+    )
+}
+
+/// The watchdog duration for a driven session (ADR-006 / ADR-007): the profile's
+/// `watchdog_minutes`, overridable by `MAESTRO_WATCHDOG_SECONDS` (tests set a
+/// short value so the wedge path is fast).
+fn watchdog_duration(rp: &ResolvedProfile) -> Duration {
+    if let Ok(secs) = std::env::var("MAESTRO_WATCHDOG_SECONDS") {
+        if let Ok(secs) = secs.trim().parse::<u64>() {
+            return Duration::from_secs(secs.max(1));
+        }
+    }
+    Duration::from_secs(u64::from(rp.watchdog_minutes.max(1)) * 60)
+}
+
+/// Build the task prompt handed to a driven CLI over the PTY (ADR-003 plan-echo):
+/// title + instructions + allowlist, then the plan-echo instruction.
+fn driven_prompt(spec: &TaskSpec) -> String {
+    let allowlist = if spec.file_allowlist.is_empty() {
+        "(none specified)".to_string()
+    } else {
+        spec.file_allowlist
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // NOTE: the prompt must NOT contain the bare plan marker token, because the
+    // PTY echoes the prompt back and the plan extractor keys on the FIRST marker
+    // occurrence. We spell the marker as PLAN<colon> in prose to avoid that.
+    format!(
+        "# Task\n## Title\n{title}\n\n## Instructions\n{instructions}\n\n\
+         ## File allowlist (only edit these)\n{allowlist}\n\n\
+         First output a single line beginning with the word PLAN followed by a \
+         colon, summarizing your plan, then implement.\n",
+        title = spec.title,
+        instructions = spec.instructions,
+        allowlist = allowlist,
+    )
+}
+
+/// Run a single DRIVEN (PTY) attempt (ADR-006 / M3). Spawns the configured CLI
+/// over a PTY in a fresh worktree, runs the plan-echo gate, registers the live
+/// session for the kill path, joins to completion, then maps the [`EndReason`]:
+///
+/// - `Completed` → mechanical gate + verifier tail (the CLI edited the worktree);
+/// - `PlanRejected` → terminal `failed(plan_rejected)`, zero edits (not fuel);
+/// - `Wedged` → terminal `failed(session_wedged)` with a partial-diff snapshot;
+/// - `Killed(Human|Advisor)` → `interrupted` + terminal `failed(interrupted_*)`
+///   with a partial-diff snapshot;
+/// - `Failed(msg)` → terminal `failed(internal_error)`.
+#[allow(clippy::too_many_arguments)]
+fn run_driven_attempt(
+    state: &DelegationState,
+    task_id: &str,
+    repo: &Path,
+    base_ref: &str,
+    spec: &TaskSpec,
+    role: &ResolvedRole,
+    attempt: i64,
+    rp: &ResolvedProfile,
+    recipe: &ContainmentRecipe,
+    prior_reports: &[ReportBody],
+) -> Result<AttemptOutcome, WorkerFailure> {
+    let model = role.model.as_str();
+
+    // The driven CLI program is required for a `driven_cli` role.
+    let program = role
+        .command
+        .clone()
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| {
+            fail(
+                "internal_error",
+                "driven_cli role has no `command` configured",
+            )
+        })?;
+    let args = role.args.clone().unwrap_or_default();
+
+    // --- fresh worktree per attempt off base_ref (the CLI edits it) -----
+    let worktree_path = worktree::create(repo, base_ref, task_id)
+        .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
+    let workspace = worktree_path.to_string_lossy().to_string();
+
+    // Wrap the driven CLI under the task's containment recipe (ADR-004): the CLI
+    // runs contained. At L0 / Backend::None `wrap` is identity, so M3 behavior is
+    // unchanged. A `wrap` error (e.g. podman needs an image) is an internal fault.
+    let spec_sandbox = recipe.spec_for(&worktree_path);
+    let wrapped = maestro_sandbox::wrap(&spec_sandbox, &program, &args)
+        .map_err(|e| fail("internal_error", format!("sandbox wrap (driven): {e}")))?;
+    let program = wrapped.program;
+    let args = wrapped.args;
+
+    // Per-session PTY log under data_dir (ADR-006 `sessions.log_path`).
+    let log_dir = paths::data_dir().join("driven-logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join(format!("{task_id}-{attempt}.log"));
+
+    emit(state, task_id, EventKind::Spawned, None);
+    let session_id = {
+        let journal = state.journal.lock().expect("journal mutex poisoned");
+        match journal.insert_session(
+            Some(task_id),
+            None,
+            Role::Implementer,
+            model,
+            SessionKind::DrivenPty,
+            Some(&workspace),
+        ) {
+            Ok(id) => {
+                let _ = journal.set_session_log_path(&id, &log_path.to_string_lossy());
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!(task = task_id, error = %e, "insert_session failed");
+                None
+            }
+        }
+    };
+
+    // Choose the plan checker: `mock` model → deterministic; else Anthropic.
+    let checker: Arc<dyn PlanChecker + Send + Sync> = if model == "mock" {
+        Arc::new(MockPlanChecker)
+    } else {
+        Arc::new(AnthropicPlanChecker::new(role.base_url.clone()))
+    };
+
+    let watchdog = watchdog_duration(rp);
+    let config = DrivenConfig {
+        program,
+        args,
+        cwd: worktree_path.clone(),
+        prompt: driven_prompt(spec),
+        log_path: log_path.clone(),
+        watchdog,
+        plan_marker: "PLAN:".to_string(),
+        // Give the plan echo a little slack over the watchdog.
+        plan_timeout: watchdog,
+        // Strip provider API keys so a subscription-authenticated CLI
+        // (claude, codex) uses its subscription (flat-rate) instead of
+        // accidentally billing per-token via a key in the daemon's env
+        // (ADR-006 `metered: false`). The daemon's own in-process calls
+        // (plan checker, shim extraction, one-shot API backends) are NOT
+        // affected — only the child process's inherited env is modified.
+        env_remove: vec![
+            "ANTHROPIC_API_KEY".into(),
+            "ANTHROPIC_AUTH_TOKEN".into(),
+            "OPENAI_API_KEY".into(),
+            "CODEX_API_KEY".into(),
+        ],
+    };
+
+    emit(state, task_id, EventKind::Iterating, None);
+
+    // Branch on the adapter: "claude" → two-phase permission-mode adapter;
+    // else → generic interactive PTY / plan-echo path.
+    let spawn_result = if role.adapter.as_deref() == Some("claude") {
+        maestro_driver::run_claude_driven(config, spec.clone(), checker)
+    } else {
+        DrivenSession::spawn(config, spec.clone(), checker)
+    };
+
+    let (handle, join) = match spawn_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
+            worktree::remove(repo, &worktree_path);
+            return Err(fail("internal_error", format!("driven spawn: {e}")));
+        }
+    };
+
+    // Register the live session for the break-glass kill path, then join.
+    state.register_session(task_id, handle);
+    let result = join.join();
+    state.unregister_session(task_id);
+
+    let result = match result {
+        Ok(r) => r,
+        Err(_) => {
+            finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
+            worktree::remove(repo, &worktree_path);
+            return Err(fail("internal_error", "driven session thread panicked"));
+        }
+    };
+
+    let turns = Some(result.turns as i64);
+
+    // A capped partial-diff snapshot for kill/wedge forensics (ADR-006).
+    let snapshot = || cap_diff(&worktree::snapshot_diff(&worktree_path, base_ref));
+
+    match result.reason {
+        EndReason::Completed => {
+            // The CLI exited on its own; subscription CLIs are unmetered
+            // (ADR-006 `metered: false`) → tokens None.
+            finish_session(state, session_id.as_deref(), ExitStatus::Ok, turns, None, None);
+            emit(state, task_id, EventKind::ImplFinished, None);
+            run_gate_and_verify(
+                state,
+                task_id,
+                base_ref,
+                spec,
+                role,
+                attempt,
+                rp,
+                recipe,
+                prior_reports,
+                &worktree_path,
+            )
+        }
+        EndReason::PlanRejected { reason } => {
+            // Terminal, ZERO edits (driver killed before edits) — NOT escalation
+            // fuel; treated like a scope violation (ADR-003). Do not commit.
+            finish_session(state, session_id.as_deref(), ExitStatus::Error, turns, None, None);
+            let payload = failure_payload(
+                "plan_rejected",
+                "driven CLI plan-echo rejected the plan before any edits",
+                Some(serde_json::json!({ "reason": reason })),
+            );
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            worktree::remove(repo, &worktree_path);
+            Ok(AttemptOutcome::ScopeViolation)
+        }
+        EndReason::Wedged => {
+            let partial_diff = snapshot();
+            finish_session(state, session_id.as_deref(), ExitStatus::Wedged, turns, None, None);
+            let payload = failure_payload(
+                "session_wedged",
+                "driven CLI produced no output past the watchdog timeout",
+                Some(serde_json::json!({ "partial_diff": partial_diff })),
+            );
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            worktree::remove(repo, &worktree_path);
+            Ok(AttemptOutcome::ScopeViolation)
+        }
+        EndReason::Killed(kind) => {
+            let partial_diff = snapshot();
+            finish_session(state, session_id.as_deref(), ExitStatus::Killed, turns, None, None);
+            let (fail_kind, kind_label) = match kind {
+                KillKind::Human => ("interrupted_human", "human"),
+                KillKind::Advisor => ("interrupted_advisor", "advisor"),
+            };
+            // First the `interrupted` event (payload: reason=kill + snapshot),
+            // then the terminal `failed(interrupted_*)` (ADR-006).
+            let interrupted_payload = serde_json::json!({
+                "reason": "kill",
+                "kill_kind": kind_label,
+                "partial_diff": partial_diff,
+            })
+            .to_string();
+            emit(state, task_id, EventKind::Interrupted, Some(&interrupted_payload));
+            let payload = failure_payload(
+                fail_kind,
+                "driven CLI session killed",
+                Some(serde_json::json!({ "partial_diff": partial_diff })),
+            );
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            worktree::remove(repo, &worktree_path);
+            Ok(AttemptOutcome::ScopeViolation)
+        }
+        EndReason::Failed(msg) => {
+            finish_session(state, session_id.as_deref(), ExitStatus::Error, turns, None, None);
+            let payload = failure_payload("internal_error", &msg, None);
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            worktree::remove(repo, &worktree_path);
+            Ok(AttemptOutcome::ScopeViolation)
+        }
+    }
+}
+
+/// Cap a partial-diff snapshot to a forensically-useful size for the terminal
+/// event payload (ADR-006). Longer diffs are truncated with a marker.
+fn cap_diff(diff: &str) -> String {
+    const CAP: usize = 4000;
+    if diff.len() <= CAP {
+        diff.to_string()
+    } else {
+        let mut s = diff[..CAP].to_string();
+        s.push_str("\n…[truncated]");
+        s
+    }
+}
+
+/// The post-implementer mechanical gate (ADR-002) + model verifier tail, shared
+/// by the one-shot API path and the driven-CLI path (whose CLI edited the same
+/// worktree). Diffs `worktree_path` vs `base_ref`, enforces the allowlist +
+/// check commands, and on pass runs the verifier and commits the branch.
+#[allow(clippy::too_many_arguments)]
+fn run_gate_and_verify(
+    state: &DelegationState,
+    task_id: &str,
+    base_ref: &str,
+    spec: &TaskSpec,
+    role: &ResolvedRole,
+    attempt: i64,
+    rp: &ResolvedProfile,
+    recipe: &ContainmentRecipe,
+    prior_reports: &[ReportBody],
+    worktree_path: &Path,
+) -> Result<AttemptOutcome, WorkerFailure> {
+    let model = role.model.as_str();
+
+    // --- mechanical gate (ADR-002) --------------------------------------
+    // The gate is a verification surface: it runs under the SAME containment
+    // recipe as the task (ADR-004 "verification surfaces inherit the task
+    // recipe"). At L0 the wrap is identity, so behavior is unchanged from M3.
+    let sandbox = recipe.spec_for(worktree_path);
+    emit(state, task_id, EventKind::ChecksStarted, None);
+    let gate_outcome = gate::run(
+        worktree_path,
+        base_ref,
+        &spec.file_allowlist,
+        &spec.check_commands,
+        &sandbox,
+    )
+    .map_err(|e| fail("internal_error", format!("gate: {e}")))?;
+
+    match gate_outcome {
+        GateOutcome::ScopeViolation { offending } => {
+            // TERMINAL — not escalation fuel (ADR-003).
+            let payload = failure_payload(
+                "scope_violation",
+                "changed paths fell outside the file allowlist",
+                Some(serde_json::json!({ "offending_paths": offending })),
+            );
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            Ok(AttemptOutcome::ScopeViolation)
+        }
+        GateOutcome::ChecksFailed {
+            command,
+            output_digest,
+        } => {
+            let payload = serde_json::json!({
+                "command": command,
+                "output_digest": output_digest,
+            })
+            .to_string();
+            emit(state, task_id, EventKind::ChecksFailed, Some(&payload));
+            // Counts as a verification failure (ADR-003). No verifier ran, so no
+            // report; carry the diff for the next attempt's context.
+            let diff = worktree::diff(worktree_path, base_ref).unwrap_or_default();
+            Ok(AttemptOutcome::VerificationFailed { diff, report: None })
+        }
+        GateOutcome::Passed => {
+            emit(state, task_id, EventKind::ChecksPassed, None);
+            // --- model verifier (ADR-002) -------------------------------
+            let gate_output = "mechanical gate: allowlist ok; check commands ok".to_string();
+            let diff = worktree::diff(worktree_path, base_ref)
+                .map_err(|e| fail("internal_error", format!("diff for verifier: {e}")))?;
+
+            let report = run_verifier(
+                state,
+                task_id,
+                spec,
+                rp,
+                model,
+                attempt,
+                &diff,
+                &gate_output,
+                prior_reports,
+            )?;
+
+            match report.verdict {
+                Verdict::Pass => {
+                    emit(state, task_id, EventKind::VerifyPassed, None);
+                    // Commit the branch; leave for human merge — NEVER auto-merge.
+                    worktree::commit_all(worktree_path, &format!("maestro: {}", spec.title))
+                        .map_err(|e| fail("internal_error", format!("commit: {e}")))?;
+                    Ok(AttemptOutcome::Passed)
+                }
+                Verdict::Fail => {
+                    emit(state, task_id, EventKind::VerifyFailed, None);
+                    Ok(AttemptOutcome::VerificationFailed {
+                        diff,
+                        report: Some(report),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Run the model verifier for an attempt (ADR-002): select a verifier distinct
+/// from the implementer, emit `verify_started`, insert a verifier session, run
+/// `verify` (retrying once on a crash/invalid report), persist the report, and
+/// finish the session with its tokens. Verifier budget is NOT charged to the
+/// implementer.
+///
+/// Failure modes: no usable verifier → `model_unavailable`; a `verify` error
+/// (crash / invalid) → retry once with a fresh session, second failure →
+/// `internal_error`; the verifier model `Unavailable` → `model_unavailable`.
+#[allow(clippy::too_many_arguments)]
+fn run_verifier(
+    state: &DelegationState,
+    task_id: &str,
+    spec: &TaskSpec,
+    rp: &ResolvedProfile,
+    impl_model: &str,
+    attempt: i64,
+    diff: &str,
+    gate_output: &str,
+    prior_reports: &[ReportBody],
+) -> Result<ReportBody, WorkerFailure> {
+    let (verifier_role, independence) = select_verifier(rp, impl_model).ok_or_else(|| {
+        fail(
+            "model_unavailable",
+            "no eligible verifier model configured (verification never skipped, ADR-002)",
+        )
+    })?;
+    let backend = select_verifier_backend(&verifier_role);
+
+    // Up to two tries: a crash / invalid report retries once with a fresh
+    // session (ADR-002).
+    let mut last_err: Option<ImplementerError> = None;
+    for try_idx in 0..2 {
+        emit(state, task_id, EventKind::VerifyStarted, None);
+        let session_id = {
+            let journal = state.journal.lock().expect("journal mutex poisoned");
+            journal
+                .insert_session(
+                    Some(task_id),
+                    None,
+                    Role::Verifier,
+                    &verifier_role.model,
+                    SessionKind::OneShotApi,
+                    None,
+                )
+                .ok()
+        };
+
+        let vtask = VerifyTask {
+            spec: spec.clone(),
+            diff: diff.to_string(),
+            gate_output: gate_output.to_string(),
+            model: verifier_role.model.clone(),
+            base_url: verifier_role.base_url.clone(),
+            prior_reports: prior_reports.to_vec(),
+        };
+
+        match backend.verify(&vtask) {
+            Ok(out) => {
+                // Persist the report; finish the session with its tokens. The
+                // verifier's tokens are its own — not the implementer's.
+                if let Some(sid) = session_id.as_deref() {
+                    let report_json = serde_json::to_string(&out.report).unwrap_or_default();
+                    let journal = state.journal.lock().expect("journal mutex poisoned");
+                    if let Err(e) = journal.insert_verifier_report(
+                        task_id,
+                        sid,
+                        attempt,
+                        independence,
+                        &report_json,
+                    ) {
+                        tracing::warn!(task = task_id, error = %e, "insert_verifier_report failed");
+                    }
+                    let _ = journal.finish_session(
+                        sid,
+                        ExitStatus::Ok,
+                        Some(out.turns as i64),
+                        Some(out.tokens_in as i64),
+                        Some(out.tokens_out as i64),
+                    );
+                }
+                return Ok(out.report);
+            }
+            Err(ImplementerError::Unavailable(m)) => {
+                finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
+                // No eligible/usable verifier → model_unavailable (never retried
+                // as a crash: unavailability is not a transient crash).
+                return Err(fail("model_unavailable", m));
+            }
+            Err(other) => {
+                // Crash / invalid report / budget exhaustion mid-report: retry
+                // once with a fresh session (ADR-002).
+                finish_session(state, session_id.as_deref(), ExitStatus::Error, None, None, None);
+                tracing::warn!(task = task_id, try_idx, error = %other, "verifier failed; retrying");
+                last_err = Some(other);
+            }
+        }
+    }
+
+    // Second failure → internal_error on the task (ADR-002).
+    Err(fail(
+        "internal_error",
+        format!(
+            "verifier failed twice: {}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maestro_journal::spec::{AcceptanceCriterion, Budget};
+
+    fn spec(criteria: Vec<AcceptanceCriterion>) -> TaskSpec {
+        TaskSpec {
+            title: "t".into(),
+            tier: Tier::T0,
+            base_ref: "HEAD".into(),
+            file_allowlist: vec![],
+            instructions: "{}".into(),
+            acceptance_criteria: criteria,
+            check_commands: vec![],
+            house_rules_ref: None,
+            budget: Budget::default(),
+            lifetime_budget: Default::default(),
+            containment_min: 0,
+        }
+    }
+
+    fn crit(id: &str, check: &str, kind: CriterionKind) -> AcceptanceCriterion {
+        AcceptanceCriterion {
+            id: id.into(),
+            check: check.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn empty_criteria_rejected() {
+        assert!(validate_spec(&spec(vec![])).is_err());
+    }
+
+    #[test]
+    fn empty_check_rejected() {
+        let s = spec(vec![crit("AC1", "   ", CriterionKind::Invariant)]);
+        assert!(validate_spec(&s).is_err());
+    }
+
+    #[test]
+    fn concrete_command_and_invariant_accepted() {
+        let s = spec(vec![
+            crit("AC1", "cargo test", CriterionKind::Command),
+            crit("AC2", "file X exists", CriterionKind::Invariant),
+        ]);
+        assert!(validate_spec(&s).is_ok());
+    }
+
+    // AC4: the pure effective-resolution + downgrade logic. Requested L2 on caps
+    // without nix → capped to L1 (bwrap present) with downgraded=true; the daemon
+    // would record L1 and emit ContainmentDowngraded.
+    #[test]
+    fn recipe_resolve_downgrades_l2_without_nix() {
+        use maestro_journal::config::ContainmentConfig;
+        // Hand-built caps: bwrap present, NO nix.
+        let mut caps = maestro_sandbox::probe();
+        caps.nix_flakes = false;
+        caps.bwrap = true;
+        caps.container_runtime = None;
+        caps.recompute_max_level();
+
+        let cc = ContainmentConfig {
+            backend: "bwrap".into(),
+            network: "deny".into(),
+            devshell_variant: None,
+            podman_image: None,
+        };
+        let repo = std::path::Path::new("/repo");
+        let recipe = ContainmentRecipe::resolve(2, &cc, &caps, repo);
+        assert_eq!(recipe.requested, maestro_sandbox::Level::L2);
+        assert_eq!(recipe.level, maestro_sandbox::Level::L1, "AC4: capped to L1 (no nix)");
+        assert!(recipe.downgraded, "AC4: downgrade flag set");
+        assert_eq!(recipe.backend, maestro_sandbox::Backend::Bwrap);
+
+        // Payload shape: { requested, actual, backend }.
+        let payload: serde_json::Value =
+            serde_json::from_str(&recipe.downgrade_payload()).unwrap();
+        assert_eq!(payload["requested"], 2);
+        assert_eq!(payload["actual"], 1);
+        assert_eq!(payload["backend"], "bwrap");
+    }
+
+    // AC4: requested L1 with NO usable backend → capped to L0, downgraded.
+    #[test]
+    fn recipe_resolve_l1_no_backend_to_l0() {
+        use maestro_journal::config::ContainmentConfig;
+        let mut caps = maestro_sandbox::probe();
+        caps.nix_flakes = false;
+        caps.bwrap = false;
+        caps.seatbelt = false;
+        caps.container_runtime = None;
+        caps.recompute_max_level();
+
+        let cc = ContainmentConfig {
+            backend: "none".into(),
+            network: "deny".into(),
+            devshell_variant: None,
+            podman_image: None,
+        };
+        let recipe = ContainmentRecipe::resolve(1, &cc, &caps, std::path::Path::new("/r"));
+        assert_eq!(recipe.level, maestro_sandbox::Level::L0);
+        assert!(recipe.downgraded);
+    }
+
+    // AC4: floor 0 → L0, never downgraded (the M1/M3 default path).
+    #[test]
+    fn recipe_resolve_floor_zero_is_l0_no_downgrade() {
+        use maestro_journal::config::ContainmentConfig;
+        let caps = maestro_sandbox::probe();
+        let cc = ContainmentConfig::default();
+        let recipe = ContainmentRecipe::resolve(0, &cc, &caps, std::path::Path::new("/r"));
+        assert_eq!(recipe.level, maestro_sandbox::Level::L0);
+        assert!(!recipe.downgraded);
+    }
+
+    // AC5 (driven): at effective L1 with Backend::Bwrap, the recipe's SandboxSpec
+    // wraps the driven CLI so DrivenConfig.program == "bwrap".
+    #[test]
+    fn recipe_wraps_driven_cli_under_bwrap() {
+        let recipe = ContainmentRecipe {
+            level: maestro_sandbox::Level::L1,
+            backend: maestro_sandbox::Backend::Bwrap,
+            network: maestro_sandbox::NetworkPolicy::Deny,
+            flake_dir: PathBuf::from("/repo"),
+            devshell_variant: None,
+            podman_image: None,
+            requested: maestro_sandbox::Level::L1,
+            downgraded: false,
+        };
+        let ws = PathBuf::from("/w");
+        let spec = recipe.spec_for(&ws);
+        let args = vec!["--print".to_string()];
+        let wrapped = maestro_sandbox::wrap(&spec, "codex", &args).unwrap();
+        assert_eq!(wrapped.program, "bwrap", "AC5: driven CLI wrapped under bwrap");
+        let n = wrapped.args.len();
+        assert_eq!(
+            &wrapped.args[n - 2..],
+            &["codex".to_string(), "--print".to_string()][..],
+            "AC5: argv ends with the driven CLI + its args"
+        );
+    }
+
+    #[test]
+    fn containment_floor_takes_max_of_profile_and_spec() {
+        let rp = ResolvedProfile::merge(&Default::default(), None);
+        // Defaults have no per-tier containment_min → 0; spec raises to 2.
+        assert_eq!(containment_floor(&rp, Tier::T0, 2), 2);
+        assert_eq!(containment_floor(&rp, Tier::T0, 0), 0);
+    }
+
+    // AC6: backend selection by role kind (ADR-008).
+    #[test]
+    fn select_backend_by_kind() {
+        // mock model / mock kind → Ok.
+        assert!(select_backend("mock", None, None).is_ok());
+        assert!(select_backend("anything", Some("mock"), None).is_ok());
+
+        // anthropic (default / explicit) → Ok, WITHOUT needing an API key
+        // (non-eager construction; we never call `.run()`).
+        assert!(select_backend("claude-sonnet-4-6", None, None).is_ok());
+        assert!(select_backend("claude-sonnet-4-6", Some("anthropic"), None).is_ok());
+        // base_url override is accepted for anthropic.
+        assert!(select_backend(
+            "claude-sonnet-4-6",
+            Some("anthropic"),
+            Some("http://localhost:8080".into())
+        )
+        .is_ok());
+
+        // Deferred / unknown kinds fail loud as model_unavailable.
+        for kind in ["driven_cli", "openai_compat", "bogus"] {
+            let err = select_backend("x", Some(kind), None)
+                .err()
+                .unwrap_or_else(|| panic!("kind {kind} must be unavailable"));
+            assert_eq!(err.kind_str(), "model_unavailable", "kind {kind}");
+        }
+    }
+
+    // The role for a tier carries kind + base_url from the Detailed table.
+    #[test]
+    fn role_for_tier_carries_kind_and_base_url() {
+        let toml = r#"
+[defaults]
+[profiles.p]
+roles.tier0 = "mock"
+roles.tier1 = { model = "qwen", kind = "openai_compat", base_url = "http://localhost:11434/v1" }
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        let rp = ResolvedProfile::merge(&cfg.defaults, cfg.profiles.get("p"));
+
+        // Bare string → no kind/base_url.
+        let t0 = role_for_tier(&rp, Tier::T0).unwrap();
+        assert_eq!(t0.model, "mock");
+        assert_eq!(t0.kind, None);
+        assert_eq!(t0.base_url, None);
+
+        // Detailed table → kind + base_url carried through.
+        let t1 = role_for_tier(&rp, Tier::T1).unwrap();
+        assert_eq!(t1.model, "qwen");
+        assert_eq!(t1.kind.as_deref(), Some("openai_compat"));
+        assert_eq!(t1.base_url.as_deref(), Some("http://localhost:11434/v1"));
+    }
+}

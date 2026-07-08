@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+repository = "local"
+
+[workspace.dependencies]
+# internal
+maestro-journal = { path = "crates/maestro-journal" }
+maestro-sandbox = { path = "crates/maestro-sandbox" }
+maestro-implementer = { path = "crates/maestro-implementer" }
+
+# external
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+ulid = { version = "1", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "macros"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "signal", "time", "sync"] }
+rustix = { version = "0.38", features = ["fs", "process"] }
+ureq = { version = "2", features = ["json"] }
+globset = "0.4"
+portable-pty = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

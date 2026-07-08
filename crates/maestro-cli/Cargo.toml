@@ -1,0 +1,23 @@
+[package]
+name = "maestro-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "maestro"
+path = "src/main.rs"
+
+[dependencies]
+maestro-journal.workspace = true
+maestro-sandbox.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+rustix.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
