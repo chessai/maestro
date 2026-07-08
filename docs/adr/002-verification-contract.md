@@ -20,7 +20,7 @@ Every task — including Tier 0 — is verified. Two stages:
 
 2. **Model verifier.** Fresh-context session, never the implementer. Input: the TaskSpec's acceptance criteria, the diff, and the mechanical gate's command outputs. Explicitly excluded: the implementer transcript. The verifier may run additional commands, but in a **throwaway checkout** of the implementation branch that is discarded after the report — its mutations can never reach the task branch, so "read-only" is structural, not requested. The verifier's sole output channel is the report: **verifiers report; they never mutate.**
 
-   **v1:** the verifier judges from the provided diff + mechanical-gate output; running additional commands in a throwaway checkout is designed but not yet built. The throwaway-checkout description above is the target.
+   **v1:** the verifier judges from the provided diff + mechanical-gate output, and MAY run up to 5 `run_command`s in a throwaway checkout — a recursive copy of the implementer's worktree with `.git` removed, so the copy is severed from the repo and its mutations structurally cannot reach the task branch. Each command runs under the task's containment recipe with a 120s per-command wall-clock timeout; combined output is captured, digested (sha256), and excerpt-capped. The report's `commands_run` is populated from the **daemon's authoritative run records**, never the model's self-reported list. Limitation: because `.git` is severed, git commands fail in the checkout by design — verifier commands are build/test/inspect (`cargo test`, `grep`, …), not git operations.
 
 ### Verifier selection
 

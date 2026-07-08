@@ -35,6 +35,7 @@ use maestro_driver::{
 
 use crate::gate::{self, GateOutcome};
 use crate::resolve::{resolve, ResolvedProfile};
+use crate::verify_checkout::ThrowawayCheckoutRunner;
 use crate::worktree;
 
 /// Shared, process-wide delegation state: the single journal writer behind a
@@ -1505,6 +1506,8 @@ fn run_gate_and_verify(
                 &diff,
                 &gate_output,
                 prior_reports,
+                worktree_path,
+                recipe,
             )?;
 
             match report.verdict {
@@ -1547,6 +1550,8 @@ fn run_verifier(
     diff: &str,
     gate_output: &str,
     prior_reports: &[ReportBody],
+    worktree_path: &Path,
+    recipe: &ContainmentRecipe,
 ) -> Result<ReportBody, WorkerFailure> {
     let (verifier_role, independence) = select_verifier(rp, impl_model).ok_or_else(|| {
         fail(
@@ -1555,6 +1560,14 @@ fn run_verifier(
         )
     })?;
     let backend = select_verifier_backend(&verifier_role);
+
+    // The verifier MAY run bounded commands in a THROWAWAY COPY of the
+    // implementer's worktree, severed from the repo (ADR-002). Built here (lazily
+    // copied on first use); dropped — and its tempdir removed — when this
+    // function returns. The MockVerifier ignores it; the AnthropicVerifier drives
+    // it via the `run_command` tool and the daemon's records populate
+    // `commands_run`.
+    let runner = ThrowawayCheckoutRunner::new(worktree_path, recipe.clone());
 
     // Up to two tries: a crash / invalid report retries once with a fresh
     // session (ADR-002).
@@ -1584,7 +1597,7 @@ fn run_verifier(
             prior_reports: prior_reports.to_vec(),
         };
 
-        match backend.verify(&vtask) {
+        match backend.verify(&vtask, &runner) {
             Ok(out) => {
                 // Persist the report; finish the session with its tokens. The
                 // verifier's tokens are its own — not the implementer's.

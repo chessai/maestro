@@ -12,6 +12,7 @@ pub mod delegate;
 pub mod gate;
 pub mod resolve;
 pub mod shim;
+pub mod verify_checkout;
 pub mod worktree;
 
 use std::collections::HashMap;
