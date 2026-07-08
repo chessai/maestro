@@ -141,6 +141,37 @@ impl Default for LifetimeFactors {
     }
 }
 
+/// Streaming credential proxy config (ADR-006 / ADR-004). The proxy is the
+/// daemon-local endpoint that injects the provider API key upstream, meters
+/// token usage per response, and hard-stops a response mid-stream when a task's
+/// token ceiling is exceeded. It is OPT-IN: `enabled` defaults to `false`, so
+/// the default live delegation path is unchanged unless a profile turns it on.
+/// TOML shape (dotted keys land in the `proxy` table): `proxy.enabled = true`,
+/// `proxy.addr = "127.0.0.1:0"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    /// Whether to start the proxy at daemon startup. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The bind address, e.g. `"127.0.0.1:0"` (ephemeral port). Default
+    /// `"127.0.0.1:0"`.
+    #[serde(default = "default_proxy_addr")]
+    pub addr: String,
+}
+
+fn default_proxy_addr() -> String {
+    "127.0.0.1:0".to_string()
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        ProxyConfig {
+            enabled: false,
+            addr: default_proxy_addr(),
+        }
+    }
+}
+
 /// Advisor filesystem-write config (ADR-006 / ADR-007).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AdvisorConfig {
@@ -192,6 +223,8 @@ pub struct Defaults {
     pub advisor: AdvisorConfig,
     #[serde(default)]
     pub containment: ContainmentConfig,
+    #[serde(default)]
+    pub proxy: ProxyConfig,
 }
 
 fn default_watchdog() -> u32 {
@@ -209,6 +242,7 @@ impl Default for Defaults {
             lifetime: LifetimeFactors::default(),
             advisor: AdvisorConfig::default(),
             containment: ContainmentConfig::default(),
+            proxy: ProxyConfig::default(),
         }
     }
 }
@@ -512,6 +546,32 @@ foo = "bar"
 "#;
         let creds = Credentials::from_toml_str(toml).expect("no-env-section parse");
         assert!(creds.env.is_empty());
+    }
+
+    // ADR-006/ADR-004: the [proxy] table parses on defaults via dotted keys, is
+    // OPT-IN (enabled defaults to false), and defaults addr to "127.0.0.1:0".
+    #[test]
+    fn proxy_table_parses_with_defaults() {
+        // Entirely unset → disabled, ephemeral-loopback addr.
+        let empty = Config::from_toml_str("[defaults]\n").unwrap();
+        assert!(!empty.defaults.proxy.enabled);
+        assert_eq!(empty.defaults.proxy.addr, "127.0.0.1:0");
+
+        // Explicitly enabled with a custom addr.
+        let toml = r#"
+[defaults]
+proxy.enabled = true
+proxy.addr = "127.0.0.1:8787"
+"#;
+        let cfg = Config::from_toml_str(toml).expect("config parses");
+        assert!(cfg.defaults.proxy.enabled);
+        assert_eq!(cfg.defaults.proxy.addr, "127.0.0.1:8787");
+
+        // enabled set but addr omitted → serde default addr.
+        let toml2 = "[defaults]\nproxy.enabled = true\n";
+        let cfg2 = Config::from_toml_str(toml2).expect("config parses");
+        assert!(cfg2.defaults.proxy.enabled);
+        assert_eq!(cfg2.defaults.proxy.addr, "127.0.0.1:0");
     }
 
     // A bare-string role stays RoleModel::Bare (⇒ default anthropic backend,

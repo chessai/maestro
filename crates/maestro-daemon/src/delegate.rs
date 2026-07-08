@@ -57,6 +57,12 @@ pub struct DelegationState {
     /// and removes it after; `KillTask` looks the handle up to fire the
     /// break-glass kill path. Empty for tasks not running a driven session.
     live_sessions: Mutex<HashMap<String, maestro_driver::SessionHandle>>,
+    /// The streaming credential proxy's shared token ledger (ADR-006 / ADR-004),
+    /// present only when the proxy is enabled (OPT-IN; default `None`). When set,
+    /// `run_pipeline` registers each task's token ceiling here so the proxy can
+    /// meter usage + hard-stop mid-stream. Side-effect-only until backends are
+    /// routed through the proxy — see the wire-up TODO in `select_backend`.
+    proxy_ledger: Option<Arc<maestro_proxy::Ledger>>,
 }
 
 struct Slots {
@@ -66,7 +72,14 @@ struct Slots {
 
 impl DelegationState {
     /// Build shared state from the opened journal and the resolved machine cap.
-    pub fn new(journal: Journal, machine_cap: u32, profile_flag: Option<String>) -> Arc<Self> {
+    /// `proxy_ledger` is `Some` only when the streaming credential proxy is
+    /// enabled (OPT-IN); it is `None` on the default path.
+    pub fn new(
+        journal: Journal,
+        machine_cap: u32,
+        profile_flag: Option<String>,
+        proxy_ledger: Option<Arc<maestro_proxy::Ledger>>,
+    ) -> Arc<Self> {
         Arc::new(DelegationState {
             journal: Arc::new(Mutex::new(journal)),
             slots: Mutex::new(Slots {
@@ -77,6 +90,7 @@ impl DelegationState {
             profile_flag,
             caps: maestro_sandbox::probe(),
             live_sessions: Mutex::new(HashMap::new()),
+            proxy_ledger,
         })
     }
 
@@ -279,6 +293,12 @@ pub fn select_backend(
         return Ok(Box::new(MockBackend));
     }
     match kind {
+        // TODO(proxy wire-up): route metered backends through proxy_base_url with
+        // X-Maestro-Task. When the proxy is enabled, override this backend's
+        // base_url to the daemon-local proxy address and set the X-Maestro-Task
+        // header to the task id, so the proxy injects the key upstream, meters
+        // token usage into the ledger, and hard-stops mid-stream on ceiling. Left
+        // unwired in this pass so the live path stays byte-for-byte unchanged.
         None | Some("anthropic") => Ok(Box::new(AnthropicBackend::new(base_url))),
         Some("driven_cli") => Err(DelegateError::ModelUnavailable(
             "driven_cli backend is not available until M3".into(),
@@ -941,6 +961,16 @@ fn run_pipeline(
         .lifetime_budget
         .wall_clock_minutes
         .or(Some(rp.lifetime.wall_clock_minutes));
+
+    // Proxy ledger registration (ADR-006 / ADR-004): when the streaming
+    // credential proxy is enabled, tell its ledger this task's token ceiling so
+    // it can meter usage and hard-stop mid-stream once the ceiling is crossed.
+    // This is SIDE-EFFECT-ONLY in this pass: the backends are not yet routed
+    // through the proxy (see the wire-up TODO in `select_backend`), so on both
+    // the flag-off and flag-on paths the live delegation behavior is unchanged.
+    if let Some(ledger) = state.proxy_ledger.as_ref() {
+        ledger.register(task_id, token_ceiling);
+    }
 
     let start_tier = spec.tier;
     let top = top_tier(&rp, start_tier);

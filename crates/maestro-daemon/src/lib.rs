@@ -102,6 +102,21 @@ pub struct SharedState {
     /// Per-advisor inbox cursors (in-memory; advanced on each drain).
     inbox_cursors: InboxCursors,
     opts: Options,
+    /// The streaming credential proxy runtime (ADR-006 / ADR-004), present only
+    /// when `[defaults].proxy.enabled` is true. `None` on the default path (the
+    /// common case), in which case the proxy is never started.
+    #[allow(dead_code)]
+    proxy: Option<ProxyRuntime>,
+}
+
+/// The started streaming-credential-proxy: its shared token ledger and the
+/// address it bound. Held so the ledger stays alive for the daemon's lifetime;
+/// the server thread runs detached. The bound addr is retained for the eventual
+/// backend wire-up (routing metered backends through this address).
+#[allow(dead_code)]
+struct ProxyRuntime {
+    ledger: Arc<maestro_proxy::Ledger>,
+    addr: std::net::SocketAddr,
 }
 
 /// A started daemon: owns the shared runtime state, the bound listener, and the
@@ -153,8 +168,19 @@ impl Server {
         // 5. Resolve the machine concurrency cap from the active profile, then
         //    build the shared delegation state around the journal.
         let machine_cap = resolve_machine_cap(opts.profile.as_deref());
+
+        // 5-proxy. Opt-in streaming credential proxy (ADR-006 / ADR-004). Default
+        //    OFF: when disabled we do nothing and the live path is unchanged.
+        //    When enabled, create the shared token ledger, spawn the proxy server
+        //    (keys injected from ANTHROPIC_API_KEY, never entering the sandbox),
+        //    and hand the ledger to the delegation state so `run_pipeline`
+        //    registers each task's ceiling. Registration is side-effect-only
+        //    until backends are routed (see the wire-up TODO in `select_backend`).
+        let proxy = start_proxy(opts.profile.as_deref());
+        let proxy_ledger = proxy.as_ref().map(|p| Arc::clone(&p.ledger));
+
         let delegation =
-            DelegationState::new(journal, machine_cap, opts.profile.clone());
+            DelegationState::new(journal, machine_cap, opts.profile.clone(), proxy_ledger);
 
         // 5a. Reconcile orphaned in-flight tasks from a prior daemon instance
         //     BEFORE serving begins (ADR-006). Any task in a non-terminal state
@@ -164,6 +190,7 @@ impl Server {
             delegation,
             inbox_cursors: Mutex::new(HashMap::new()),
             opts,
+            proxy,
         });
 
         Ok(Server {
@@ -888,6 +915,52 @@ fn drain_inbox(state: &SharedState, advisor_session_id: &str) -> Response {
         Err(e) => Response::Error {
             message: format!("drain_inbox failed: {e}"),
         },
+    }
+}
+
+/// Start the streaming credential proxy if `[defaults].proxy.enabled` (ADR-006 /
+/// ADR-004). Returns `None` when disabled (the default) or if resolution fails —
+/// in either case the default live delegation path is unchanged. When enabled,
+/// it binds the proxy on `proxy.addr`, spawns the server thread, logs the bound
+/// address, and returns the shared ledger + bound addr for `SharedState`.
+///
+/// The upstream base and API-version mirror the Anthropic backend's conventions
+/// (`$ANTHROPIC_BASE_URL` else `https://api.anthropic.com`, version `2023-06-01`).
+/// The key provider reads `ANTHROPIC_API_KEY` from the daemon's environment at
+/// request time — the key is held by the daemon and injected upstream, never
+/// entering the sandbox that calls the proxy.
+fn start_proxy(profile_flag: Option<&str>) -> Option<ProxyRuntime> {
+    let config = load_config();
+    let env = std::env::var("MAESTRO_PROFILE").ok();
+    let rp = match resolve(profile_flag, env.as_deref(), &config).resolved {
+        Ok(rp) => rp,
+        Err(_) => return None,
+    };
+    if !rp.proxy.enabled {
+        return None;
+    }
+
+    let upstream_base = std::env::var("ANTHROPIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+    let cfg = maestro_proxy::ProxyConfig {
+        upstream_base,
+        anthropic_version: "2023-06-01".to_string(),
+    };
+    let ledger = Arc::new(maestro_proxy::Ledger::new());
+    let key_provider: maestro_proxy::KeyProvider =
+        Arc::new(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()));
+
+    match maestro_proxy::spawn(&rp.proxy.addr, cfg, Arc::clone(&ledger), key_provider) {
+        Ok((addr, _handle)) => {
+            tracing::info!(proxy_addr = %addr, "streaming credential proxy started (opt-in)");
+            Some(ProxyRuntime { ledger, addr })
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, addr = %rp.proxy.addr, "failed to start credential proxy; continuing without it");
+            None
+        }
     }
 }
 

@@ -17,6 +17,7 @@ path = "src/main.rs"
 maestro-journal.workspace = true
 maestro-sandbox.workspace = true
 maestro-implementer.workspace = true
+maestro-proxy.workspace = true
 maestro-driver = { path = "../maestro-driver" }
 maestro-shim = { path = "../maestro-shim" }
 sha2 = "0.10"

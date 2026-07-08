@@ -13,6 +13,7 @@ repository = "local"
 maestro-journal = { path = "crates/maestro-journal" }
 maestro-sandbox = { path = "crates/maestro-sandbox" }
 maestro-implementer = { path = "crates/maestro-implementer" }
+maestro-proxy = { path = "crates/maestro-proxy" }
 
 # external
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +28,7 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "signal", "time", "sync"] }
 rustix = { version = "0.38", features = ["fs", "process"] }
 ureq = { version = "2", features = ["json"] }
+tiny_http = "0.12"
 globset = "0.4"
 portable-pty = "0.8"
 tracing = "0.1"
