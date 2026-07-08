@@ -262,16 +262,22 @@ pub fn snapshot_diff(worktree: &Path, base_ref: &str) -> String {
     }
 }
 
-/// The result of a successful [`merge_task_branch`]: the base ref now points at
-/// `merged_sha` (the tip of the task branch).
+/// The result of a successful [`merge_task_branch`]: the base branch now
+/// includes the task branch, via a fast-forward or a 3-way merge commit, and
+/// points at `merged_sha`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeOutcome {
-    /// The commit the base ref was fast-forwarded to (the task branch tip).
+    /// The commit the base ref now points at: either the task branch tip (a
+    /// fast-forward) or the new 2-parent merge commit (a diverged 3-way merge).
     pub merged_sha: String,
     /// The base branch that was advanced (a bare branch name, e.g. `main`).
     pub base_ref: String,
     /// The task branch that was merged (`maestro/<task_id>`).
     pub branch: String,
+    /// `true` if the base was fast-forwarded (base was an ancestor of the task
+    /// tip); `false` if the base had diverged and a conflict-free 3-way merge
+    /// commit was created instead.
+    pub fast_forward: bool,
 }
 
 /// Run `git` scoped to `repo`, returning trimmed stdout on success. Uses the same
@@ -295,21 +301,28 @@ fn git_ok(repo: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Fast-forward-merge the passed task's branch `maestro/<task_id>` into
-/// `base_ref` (ADR-006, advisor-initiated `merge_task`). This is fast-forward
-/// ONLY and NEVER disturbs a working tree it does not have to.
+/// Merge the passed task's branch `maestro/<task_id>` into `base_ref` (ADR-006,
+/// advisor-initiated `merge_task`), preferring a fast-forward but falling back to
+/// a conflict-free 3-way merge when the base has diverged. This NEVER disturbs a
+/// working tree it does not have to, and never mutates a ref on a conflict/error.
 ///
-/// The branch was cut off `base_ref` and only added commits, so it is normally a
-/// fast-forward of `base_ref`. Steps:
+/// The branch was cut off `base_ref` and only added commits. Steps:
 /// 1. resolve `task_sha` from `refs/heads/maestro/<task_id>` (missing → error);
 /// 2. require `base_ref` to name an existing LOCAL branch (a SHA / tag / missing
 ///    branch → error, "merge manually");
-/// 3. fast-forward guard: `base_sha` must be an ancestor of `task_sha`
-///    (not-ff → error, no merge performed);
-/// 4. if `base_ref` is the checked-out branch, require a clean working tree and
-///    `merge --ff-only`; otherwise advance the ref with a compare-and-swap
-///    `update-ref refs/heads/<base_ref> <task_sha> <base_sha>` (no working tree
-///    is touched).
+/// 3. branch on divergence:
+///    - **base is an ancestor of the task tip (fast-forward)**: advance the base
+///      to `task_sha`. If `base_ref` is the checked-out branch, require a clean
+///      working tree and `merge --ff-only`; otherwise a compare-and-swap
+///      `update-ref refs/heads/<base_ref> <task_sha> <base_sha>` (no working tree
+///      touched). `fast_forward = true`.
+///    - **diverged**: compute the merge in memory with
+///      `git merge-tree --write-tree <base_sha> <task_sha>`. On a CONFLICT
+///      (exit 1) → error listing the conflicted paths, NO ref mutated. On a CLEAN
+///      merge (exit 0) → create a real 2-parent merge commit: if `base_ref` is
+///      checked out, `merge --no-ff` (requiring a clean tree); otherwise
+///      `commit-tree <merged_tree> -p <base_sha> -p <task_sha>` + a
+///      compare-and-swap `update-ref`. `fast_forward = false`.
 ///
 /// On success returns the [`MergeOutcome`]; the caller emits `merged`, removes
 /// the worktree, and best-effort deletes the task branch.
@@ -329,45 +342,129 @@ pub fn merge_task_branch(repo_path: &Path, base_ref: &str, task_id: &str) -> Res
     }
     let base_sha = git_c(repo, &["rev-parse", "--verify", &base_branch_ref])?;
 
-    // 3. Fast-forward guard: base must be an ancestor of the task tip.
-    if !git_ok(repo, &["merge-base", "--is-ancestor", &base_sha, &task_sha]) {
-        bail!(
-            "base '{base_ref}' has advanced since the task branched; \
-             not a fast-forward — rebase/merge manually"
-        );
-    }
-
-    // 4. Advance the base ref. If base_ref is checked out, do a real ff merge
-    //    (requiring a clean tree); otherwise a working-tree-free ref update.
+    // Is base_ref the currently checked-out branch? Shared by both paths.
     let checked_out = git_c(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .ok()
         .filter(|h| h == base_ref)
         .is_some();
 
-    if checked_out {
-        let status = git_c(repo, &["status", "--porcelain"])?;
-        if !status.is_empty() {
-            bail!(
-                "base branch '{base_ref}' is checked out with a dirty working tree; \
-                 commit/stash then merge"
-            );
+    // 3a. Fast-forward path: base is an ancestor of the task tip.
+    if git_ok(repo, &["merge-base", "--is-ancestor", &base_sha, &task_sha]) {
+        if checked_out {
+            let status = git_c(repo, &["status", "--porcelain"])?;
+            if !status.is_empty() {
+                bail!(
+                    "base branch '{base_ref}' is checked out with a dirty working tree; \
+                     commit/stash then merge"
+                );
+            }
+            git_c(repo, &["merge", "--ff-only", &branch_ref])
+                .with_context(|| format!("fast-forwarding {base_ref} to {branch}"))?;
+        } else {
+            // Compare-and-swap: the old-value arg makes this safe against races.
+            git_c(repo, &["update-ref", &base_branch_ref, &task_sha, &base_sha])
+                .with_context(|| format!("fast-forwarding ref {base_ref} to {branch}"))?;
         }
-        git_c(repo, &["merge", "--ff-only", &branch_ref])
-            .with_context(|| format!("fast-forwarding {base_ref} to {branch}"))?;
-    } else {
-        // Compare-and-swap: the old-value arg makes this safe against races.
-        git_c(
-            repo,
-            &["update-ref", &base_branch_ref, &task_sha, &base_sha],
-        )
-        .with_context(|| format!("fast-forwarding ref {base_ref} to {branch}"))?;
+
+        return Ok(MergeOutcome {
+            merged_sha: task_sha,
+            base_ref: base_ref.to_string(),
+            branch,
+            fast_forward: true,
+        });
     }
 
-    Ok(MergeOutcome {
-        merged_sha: task_sha,
-        base_ref: base_ref.to_string(),
-        branch,
-    })
+    // 3b. Diverged path: attempt a conflict-free 3-way merge.
+    //
+    // Compute the merge in memory (pure — mutates no ref/worktree). git 2.x
+    // `merge-tree --write-tree`: exit 0 → clean, stdout's FIRST line is the
+    // merged tree OID; exit 1 → conflicts, stdout lists conflicted paths; exit
+    // >1 → a real error. We need both the exit code and stdout, so use a raw
+    // Command (git_c would discard the code and bail on any non-zero exit).
+    let mt = Command::new("git")
+        .args(["-C", repo, "merge-tree", "--write-tree", &base_sha, &task_sha])
+        .output()
+        .with_context(|| "spawning `git merge-tree --write-tree`")?;
+    let mt_stdout = String::from_utf8_lossy(&mt.stdout);
+    let code = mt.status.code();
+
+    match code {
+        Some(0) => {
+            // Clean merge. The merged tree OID is the first line of stdout.
+            let merged_tree = mt_stdout
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .context("merge-tree reported a clean merge but wrote no tree OID")?
+                .to_string();
+
+            let merge_msg = format!("maestro: merge {branch} into {base_ref}");
+            let merged_sha = if checked_out {
+                // Real merge in the working tree (recomputes the same clean
+                // merge and updates tree+ref+commit natively). Require clean.
+                let status = git_c(repo, &["status", "--porcelain"])?;
+                if !status.is_empty() {
+                    bail!(
+                        "base branch '{base_ref}' is checked out with a dirty working tree; \
+                         commit/stash then merge"
+                    );
+                }
+                git_c(repo, &["merge", "--no-ff", "--no-edit", &branch_ref])
+                    .with_context(|| format!("3-way merging {branch} into {base_ref}"))?;
+                git_c(repo, &["rev-parse", "HEAD"])?
+            } else {
+                // Build the merge commit off the merged tree with two parents
+                // (base then task), then advance the ref race-safely (CAS).
+                let commit = git_c(
+                    repo,
+                    &[
+                        "commit-tree",
+                        &merged_tree,
+                        "-p",
+                        &base_sha,
+                        "-p",
+                        &task_sha,
+                        "-m",
+                        &merge_msg,
+                    ],
+                )
+                .with_context(|| format!("creating merge commit for {branch} into {base_ref}"))?;
+                git_c(repo, &["update-ref", &base_branch_ref, &commit, &base_sha])
+                    .with_context(|| format!("advancing ref {base_ref} to merge commit"))?;
+                commit
+            };
+
+            Ok(MergeOutcome {
+                merged_sha,
+                base_ref: base_ref.to_string(),
+                branch,
+                fast_forward: false,
+            })
+        }
+        Some(1) => {
+            // Conflicts: stdout lists the conflicted paths. No ref was mutated.
+            let paths = mt_stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "base '{base_ref}' has advanced and merging {branch} conflicts — \
+                 resolve manually (conflicted paths: {paths})"
+            );
+        }
+        _ => {
+            let stderr = String::from_utf8_lossy(&mt.stderr);
+            bail!(
+                "`git merge-tree` failed ({}): {}{}",
+                mt.status,
+                mt_stdout,
+                stderr
+            );
+        }
+    }
 }
 
 /// Best-effort deletion of a task's branch `maestro/<task_id>` (`git branch -D`).
@@ -518,31 +615,136 @@ mod tests {
         assert_eq!(out.merged_sha, task_tip);
         assert_eq!(out.base_ref, "main");
         assert_eq!(out.branch, "maestro/ff1");
+        assert!(out.fast_forward, "ancestor base → fast-forward");
         // `main` now points at the task commit; the working tree was untouched.
         assert_eq!(head_of(rp, "main"), task_tip, "main advanced to task tip");
     }
 
+    /// Add a `maestro/<task_id>` branch off `HEAD` that edits (creates) `file`
+    /// with `content`, without leaving a worktree attached. Returns the tip SHA.
+    fn add_task_branch_writing(repo: &Path, task_id: &str, file: &str, content: &str) -> String {
+        let rp = repo.to_str().unwrap();
+        let branch = format!("maestro/{task_id}");
+        let wt = TempDir::new().unwrap();
+        let wtp = wt.path().to_str().unwrap();
+        git(&["-C", rp, "worktree", "add", wtp, "-b", &branch, "HEAD"]).unwrap();
+        std::fs::write(wt.path().join(file), content).unwrap();
+        git(&["-C", wtp, "add", "-A"]).unwrap();
+        git(&["-C", wtp, "commit", "-q", "-m", &format!("task {task_id}")]).unwrap();
+        let tip = git(&["-C", rp, "rev-parse", &format!("refs/heads/{branch}")])
+            .unwrap()
+            .trim()
+            .to_string();
+        remove(repo, wt.path());
+        tip
+    }
+
+    /// Commit `content` to `file` directly on the checked-out `main`, advancing it.
+    fn advance_main(repo: &Path, file: &str, content: &str) {
+        let rp = repo.to_str().unwrap();
+        std::fs::write(repo.join(file), content).unwrap();
+        git(&["-C", rp, "add", "-A"]).unwrap();
+        git(&["-C", rp, "commit", "-q", "-m", &format!("advance main: {file}")]).unwrap();
+    }
+
+    /// The number of parents of `rev` (2 ⇒ a merge commit).
+    fn parent_count(repo: &Path, rev: &str) -> usize {
+        let out = git(&["-C", repo.to_str().unwrap(), "rev-list", "--parents", "-n1", rev]).unwrap();
+        // Output: "<commit> <parent1> <parent2> ..." → parents = tokens - 1.
+        out.split_whitespace().count().saturating_sub(1)
+    }
+
+    /// The file content at `rev:path`, or None if the path is absent there.
+    fn file_at(repo: &Path, rev: &str, path: &str) -> Option<String> {
+        git(&["-C", repo.to_str().unwrap(), "show", &format!("{rev}:{path}")]).ok()
+    }
+
     #[test]
-    fn merge_refused_when_not_fast_forward() {
+    fn merge_diverged_conflict_free_base_not_checked_out() {
+        let repo = init_repo();
+        let rp = repo.path();
+        // Task branch edits a.txt off the initial commit.
+        add_task_branch_writing(rp, "d1", "a.txt", "A\n");
+        // Advance main on a DIFFERENT file so it diverges without conflict.
+        advance_main(rp, "b.txt", "B\n");
+        let main_before = head_of(rp, "main");
+        // Detach HEAD so main is NOT checked out → commit-tree + update-ref path.
+        git(&["-C", rp.to_str().unwrap(), "checkout", "-q", "--detach", &main_before]).unwrap();
+
+        let out = merge_task_branch(rp, "main", "d1").expect("conflict-free 3-way merge succeeds");
+        assert!(!out.fast_forward, "diverged base → not a fast-forward");
+        let tip = head_of(rp, "main");
+        assert_eq!(out.merged_sha, tip, "outcome sha is main's new tip");
+        assert_ne!(tip, main_before, "main advanced");
+        assert_eq!(parent_count(rp, "main"), 2, "new tip is a 2-parent merge commit");
+        // Both changes are present in the merged tree.
+        assert_eq!(file_at(rp, "main", "a.txt").as_deref(), Some("A\n"), "task change present");
+        assert_eq!(file_at(rp, "main", "b.txt").as_deref(), Some("B\n"), "base change present");
+    }
+
+    #[test]
+    fn merge_diverged_conflict_free_base_checked_out() {
+        let repo = init_repo();
+        let rp = repo.path();
+        add_task_branch_writing(rp, "d2", "a.txt", "A\n");
+        // main stays checked out and clean → the `merge --no-ff` path.
+        advance_main(rp, "b.txt", "B\n");
+        let main_before = head_of(rp, "main");
+
+        let out = merge_task_branch(rp, "main", "d2").expect("conflict-free 3-way merge succeeds");
+        assert!(!out.fast_forward, "diverged base → not a fast-forward");
+        let tip = head_of(rp, "main");
+        assert_eq!(out.merged_sha, tip);
+        assert_ne!(tip, main_before, "main advanced");
+        assert_eq!(parent_count(rp, "main"), 2, "new tip is a 2-parent merge commit");
+        assert_eq!(file_at(rp, "main", "a.txt").as_deref(), Some("A\n"), "task change present");
+        assert_eq!(file_at(rp, "main", "b.txt").as_deref(), Some("B\n"), "base change present");
+    }
+
+    #[test]
+    fn merge_diverged_with_conflict_is_refused_and_leaves_base_unchanged() {
+        let repo = init_repo();
+        let rp = repo.path();
+        // Task and base both edit the SAME file incompatibly → real conflict.
+        add_task_branch_writing(rp, "d3", "clash.txt", "task side\n");
+        advance_main(rp, "clash.txt", "base side\n");
+        let main_before = head_of(rp, "main");
+
+        let err = merge_task_branch(rp, "main", "d3").expect_err("conflicting 3-way merge refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("conflict"), "error mentions conflict, got: {msg}");
+        // No ref was mutated on the conflict path.
+        assert_eq!(head_of(rp, "main"), main_before, "main unchanged after conflict refusal");
+    }
+
+    #[test]
+    fn merge_diverged_but_clean_now_3way_merges_instead_of_refusing() {
+        // Regression rename of the former `merge_refused_when_not_fast_forward`:
+        // a divergence on a DIFFERENT file used to be refused ("not a
+        // fast-forward"); it now succeeds via a conflict-free 3-way merge.
         let repo = init_repo();
         let rp = repo.path();
         let rps = rp.to_str().unwrap();
-        let _task_tip = add_task_branch(rp, "nf1");
-        // Advance `main` with an extra commit AFTER branching so the task branch
-        // is no longer a fast-forward of main.
+        // Task branch adds feature.txt off the initial commit.
+        let task_tip = add_task_branch(rp, "nf1");
+        // Advance `main` on a DIFFERENT file so it diverges without conflict.
         std::fs::write(rp.join("other.txt"), "x\n").unwrap();
         git(&["-C", rps, "add", "-A"]).unwrap();
         git(&["-C", rps, "commit", "-q", "-m", "advance main"]).unwrap();
         let main_before = head_of(rp, "main");
 
-        let err = merge_task_branch(rp, "main", "nf1").expect_err("non-ff must be refused");
-        let msg = format!("{err:#}");
+        let out = merge_task_branch(rp, "main", "nf1").expect("diverged clean → 3-way merge");
+        assert!(!out.fast_forward, "diverged → not a fast-forward");
+        assert_ne!(head_of(rp, "main"), main_before, "main advanced past the merge commit");
+        assert_eq!(parent_count(rp, "main"), 2, "new tip is a 2-parent merge commit");
+        // Both the task's file and main's file are present in the merged tree.
+        assert!(file_at(rp, "main", "feature.txt").is_some(), "task file present");
+        assert!(file_at(rp, "main", "other.txt").is_some(), "base file present");
+        // The task tip is an ancestor of the new merge commit (it was merged in).
         assert!(
-            msg.contains("fast-forward") || msg.contains("advanced"),
-            "error mentions the ff failure, got: {msg}"
+            git_ok(rps, &["merge-base", "--is-ancestor", &task_tip, &head_of(rp, "main")]),
+            "task tip merged into main"
         );
-        // main was not moved and no merge was performed.
-        assert_eq!(head_of(rp, "main"), main_before, "main unchanged after refusal");
     }
 
     #[test]

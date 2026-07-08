@@ -47,7 +47,7 @@ Two write channels are carved out of the read-only mount:
 
 `delegate(task_spec)`, `task_status(filter?)`, `kill_task(task_id)`, `close_task(task_id, outcome, successor?)` (resolves `blocked` tasks: `abandoned` | `superseded`), `merge_task(task_id)` (bypass-only), `search(queries)`, `fetch_extract(url, schema)`, `journal_query(named_query, params)` (curated read-only queries: recent traces, verifier reports, cost summaries — not raw SQL).
 
-**v1:** `merge_task` is built as an explicit advisor-initiated action gated on the task's resting `verify_passed` state; it performs a **fast-forward-only** merge of `maestro/<task-ulid>` into the task's base branch (compare-and-swap `update-ref` when the base is not checked out; `merge --ff-only` on a clean checked-out base), refuses non-ff / dirty / non-branch bases with a structured error, and emits the `merged` event. The daemon still never merges on its own — merge happens only on this explicit request. The bypass-mode restriction is a client-side Claude Code permission concern (unverifiable from the daemon). See also Merge path below.
+**v1:** `merge_task` is built as an explicit advisor-initiated action gated on the task's resting `verify_passed` state; it merges `maestro/<task-ulid>` into the task's base branch and emits the `merged` event. When the base is an ancestor of the task tip it **fast-forwards** (compare-and-swap `update-ref` when the base is not checked out; `merge --ff-only` on a clean checked-out base). When the base has **diverged** (e.g. an earlier card in a parallel batch already merged), it attempts a **conflict-free 3-way merge** (`git merge-tree` detects conflicts purely; a clean result becomes a 2-parent merge commit via `commit-tree`+CAS-`update-ref`, or `merge --no-ff` on a clean checked-out base) — refusing with a structured error **only on a genuine conflict** (no ref is mutated on refusal) or a dirty checked-out / non-branch base. This lets a parallel batch of disjoint-file tasks all integrate (the first fast-forwards, the rest 3-way merge cleanly); the `merged` payload records `fast_forward`. The daemon still never merges on its own — merge happens only on this explicit request. The bypass-mode restriction is a client-side Claude Code permission concern (unverifiable from the daemon). See also Merge path below.
 
 ### Notification
 
@@ -71,7 +71,7 @@ Because the daemon owns PTYs in-process, a daemon restart (the version-skew reme
 
 Verified work sits on `maestro/<task-ulid>`. Never auto-merged. The advisor presents diff summary + verifier report; merging is a human git/PR action, or `merge_task` in bypass mode (fast-forward or merge commit into the task's base ref; conflicts → task `blocked`, never auto-resolved).
 
-**v1:** `merge_task` performs a fast-forward-only merge into the task's base branch and emits the `merged` event (ADR-001); non-ff / conflicting merges are refused with a structured error (the human resolves them via `git`/PR), never auto-resolved to `blocked`.
+**v1:** `merge_task` merges into the task's base branch and emits the `merged` event (ADR-001): fast-forward when the base is an ancestor, else a **conflict-free 3-way merge** (so a parallel batch of disjoint-file tasks all integrate). Only a genuine content conflict (or a dirty checked-out / non-branch base) is refused with a structured error — the human resolves those via `git`/PR — never auto-resolved to `blocked`.
 
 ### API proxying and cost
 

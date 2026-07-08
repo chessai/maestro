@@ -629,13 +629,15 @@ fn close_task(
     }
 }
 
-/// `MergeTask`: explicit, advisor-initiated fast-forward merge of a passed task's
-/// branch into its `base_ref` (ADR-006). This is NOT auto-merge — the daemon
-/// never merges on its own; this runs ONLY on this request and is gated on the
-/// task resting in `verify_passed` (passed, committed, awaiting merge). On a
-/// successful fast-forward it emits `merged`, removes the worktree, best-effort
-/// deletes the task branch, and replies `Merged`. A non-fast-forward / missing
-/// branch / non-branch base is an `Error` and NO `merged` event is written.
+/// `MergeTask`: explicit, advisor-initiated merge of a passed task's branch into
+/// its `base_ref` (ADR-006). This is NOT auto-merge — the daemon never merges on
+/// its own; this runs ONLY on this request and is gated on the task resting in
+/// `verify_passed` (passed, committed, awaiting merge). It fast-forwards when the
+/// base is still an ancestor, and otherwise performs a conflict-free 3-way merge
+/// (a real merge commit) when the base has diverged without conflicts. On success
+/// it emits `merged`, removes the worktree, best-effort deletes the task branch,
+/// and replies `Merged`. A real merge conflict / missing branch / non-branch base
+/// is an `Error` and NO `merged` event is written.
 fn merge_task(state: &SharedState, _advisor_session_id: &str, task_id: &str) -> Response {
     use maestro_journal::domain::EventKind;
 
@@ -697,6 +699,7 @@ fn merge_task(state: &SharedState, _advisor_session_id: &str, task_id: &str) -> 
         "base_ref": outcome.base_ref,
         "branch": outcome.branch,
         "merged_sha": outcome.merged_sha,
+        "fast_forward": outcome.fast_forward,
     })
     .to_string();
     {

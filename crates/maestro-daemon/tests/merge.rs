@@ -352,6 +352,84 @@ roles.verifier_floor = "mock"
     assert_ne!(head_tip, main_before, "task added a commit");
     assert_eq!(rev(&repo, "main"), head_tip, "main advanced to the HEAD-based task tip");
 
+    // ---- PARALLEL BATCH: two disjoint tasks off the same base; ff then 3-way ----
+    // Both branch off the SAME `main` tip. Merging the first fast-forwards main;
+    // the second is then DIVERGED (its base moved under it) but touches a
+    // DIFFERENT file, so it must integrate via a conflict-free 3-way merge.
+    let batch_base = rev(&repo, "main");
+    let card_a = delegate(&socket, &advisor, &repo_path, spec("main", "src/card_a.rs", true));
+    let card_b = delegate(&socket, &advisor, &repo_path, spec("main", "src/card_b.rs", true));
+    assert_eq!(
+        poll_terminal(&socket, &advisor, &card_a, Duration::from_secs(30)),
+        "verify_passed",
+        "card A passes"
+    );
+    assert_eq!(
+        poll_terminal(&socket, &advisor, &card_b, Duration::from_secs(30)),
+        "verify_passed",
+        "card B passes"
+    );
+    // Both cards branched off the same base commit.
+    let tip_a = rev(&repo, &format!("maestro/{card_a}"));
+    let tip_b = rev(&repo, &format!("maestro/{card_b}"));
+    assert_ne!(tip_a, batch_base, "card A has a commit");
+    assert_ne!(tip_b, batch_base, "card B has a commit");
+
+    // Merge A first → fast-forward (base is still an ancestor).
+    let merged_a = round_trip(
+        &socket,
+        &Request::MergeTask {
+            advisor_session_id: advisor.clone(),
+            task_id: card_a.clone(),
+        },
+    );
+    assert!(matches!(merged_a, Response::Merged { .. }), "card A merges, got {merged_a:?}");
+    assert_eq!(rev(&repo, "main"), tip_a, "main fast-forwarded to card A tip");
+    {
+        let ka = event_kinds(&card_a);
+        assert_eq!(ka.last().map(String::as_str), Some("merged"), "card A merged journaled: {ka:?}");
+    }
+
+    // Merge B second → main has DIVERGED from B's base; disjoint files → 3-way merge.
+    let merged_b = round_trip(
+        &socket,
+        &Request::MergeTask {
+            advisor_session_id: advisor.clone(),
+            task_id: card_b.clone(),
+        },
+    );
+    assert!(matches!(merged_b, Response::Merged { .. }), "card B 3-way merges, got {merged_b:?}");
+    {
+        let kb = event_kinds(&card_b);
+        assert_eq!(kb.last().map(String::as_str), Some("merged"), "card B merged journaled: {kb:?}");
+        // The merged event carries fast_forward=false for the diverged card.
+        let db_path = maestro_journal::paths::journal_db_path();
+        let journal =
+            maestro_journal::Journal::open(db_path.to_str().unwrap()).expect("open journal");
+        let chain = journal.event_chain(&card_b).unwrap();
+        let ev = chain.last().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(ev.payload.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(payload["fast_forward"], false, "card B was a 3-way merge, not a ff");
+    }
+    // The base branch ends up containing BOTH cards' files — the parallel batch
+    // integrated cleanly.
+    let main_final = rev(&repo, "main");
+    assert!(
+        Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["cat-file", "-e", &format!("{main_final}:src/card_a.rs")])
+            .output().unwrap().status.success(),
+        "main contains card A's file"
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["cat-file", "-e", &format!("{main_final}:src/card_b.rs")])
+            .output().unwrap().status.success(),
+        "main contains card B's file"
+    );
+
     shutdown.store(true, Ordering::SeqCst);
     handle.join().expect("server thread joins");
     let _ = std::fs::remove_dir_all(&tmp);
