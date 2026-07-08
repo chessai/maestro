@@ -230,6 +230,7 @@ fn print_probe(probe: &serde_json::Value) {
         "bwrap",
         "seatbelt",
         "container_runtime",
+        "container_runtime_functional",
         "max_level_available",
     ];
     if let Some(obj) = probe.as_object() {

@@ -115,6 +115,12 @@ pub struct Capabilities {
     /// "docker". `None` if neither is present.
     pub container_runtime: Option<String>,
 
+    /// The detected `container_runtime` responded to a health check — for
+    /// podman/docker, `<rt> info` exited 0. `false` when `container_runtime`
+    /// is `None` or the runtime binary is present but broken (e.g. missing
+    /// `newuidmap` / `policy.json` for rootless podman).
+    pub container_runtime_functional: bool,
+
     /// Agent CLI detection results.
     pub agent_native: AgentNative,
 
@@ -146,6 +152,7 @@ impl fmt::Display for Capabilities {
             "Container runtime: {}",
             self.container_runtime.as_deref().unwrap_or("none")
         )?;
+        writeln!(f, "Container functional: {}", yn(self.container_runtime_functional))?;
         writeln!(f, "Agent CLIs      : {}", self.agent_native)?;
         write!(f, "Max level       : {}", self.max_level_available)
     }
@@ -234,7 +241,7 @@ pub fn resolve_backend(configured: &str, caps: &Capabilities) -> Backend {
         "none" => Backend::None,
         // "auto" and any unrecognized value fall through to auto-selection.
         _ => {
-            if caps.container_runtime.as_deref() == Some("podman") {
+            if caps.container_runtime.as_deref() == Some("podman") && caps.container_runtime_functional {
                 Backend::Podman
             } else if caps.bwrap {
                 Backend::Bwrap
@@ -280,6 +287,12 @@ pub struct SandboxSpec {
     pub podman_image: Option<String>,
 }
 
+/// The out-of-the-box container image used by the Podman backend when
+/// `containment.podman_image` is unset. Overridable per profile. Tracks the
+/// Rust 1.x toolchain this repo builds against; a work profile targeting
+/// another stack should override it.
+pub const DEFAULT_PODMAN_IMAGE: &str = "docker.io/library/rust:1";
+
 /// A wrapped command: the outer program and argv the daemon should spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrappedCommand {
@@ -292,7 +305,11 @@ pub struct WrappedCommand {
 /// Errors constructing a wrapped command.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SandboxError {
-    /// The Podman backend requires an image (it does not inherit the host toolchain).
+    /// Reserved: previously returned when no podman_image was configured.
+    /// Since `wrap_podman` now falls back to `DEFAULT_PODMAN_IMAGE`, this
+    /// variant is unreachable from `wrap_podman` but is kept for API
+    /// compatibility and potential future use.
+    #[allow(dead_code)]
     #[error("the podman backend requires a container image (podman_image), \
              but none was set: podman does not inherit the host toolchain")]
     PodmanImageRequired,
@@ -474,10 +491,7 @@ fn wrap_podman(
     program: &str,
     args: &[String],
 ) -> Result<WrappedCommand, SandboxError> {
-    let image = spec
-        .podman_image
-        .as_ref()
-        .ok_or(SandboxError::PodmanImageRequired)?;
+    let image = spec.podman_image.as_deref().unwrap_or(DEFAULT_PODMAN_IMAGE);
     let ws = spec.workspace.display().to_string();
     let mut a: Vec<String> = vec!["run".to_string(), "--rm".to_string()];
     if spec.network == NetworkPolicy::Deny {
@@ -488,7 +502,7 @@ fn wrap_podman(
     a.push(format!("{ws}:{ws}:rw"));
     a.push("-w".to_string());
     a.push(ws);
-    a.push(image.clone());
+    a.push(image.to_string());
     a.push(program.to_string());
     a.extend(args.iter().cloned());
     Ok(WrappedCommand {
@@ -672,7 +686,7 @@ fn backend_usable(backend: Backend, caps: &Capabilities) -> bool {
     match backend {
         Backend::None => false,
         Backend::Bwrap => caps.bwrap,
-        Backend::Podman => caps.container_runtime.as_deref() == Some("podman"),
+        Backend::Podman => caps.container_runtime.as_deref() == Some("podman") && caps.container_runtime_functional,
         Backend::Seatbelt => caps.seatbelt,
     }
 }
@@ -772,6 +786,14 @@ pub fn probe() -> Capabilities {
         None
     };
 
+    // Health-check the detected runtime: `<rt> info` must exit 0. A present-
+    // but-broken podman (missing newuidmap, policy.json, etc.) is detected here
+    // and downgrades auto-selection to bwrap instead of failing at wrap time.
+    let container_runtime_functional = match &container_runtime {
+        Some(rt) => command_ok(rt, &["info"]),
+        None => false,
+    };
+
     // Agent CLIs.
     let agent_native = AgentNative {
         codex: has_exe("codex"),
@@ -786,6 +808,7 @@ pub fn probe() -> Capabilities {
         bwrap,
         seatbelt,
         container_runtime,
+        container_runtime_functional,
         agent_native,
         max_level_available,
     }
@@ -797,7 +820,9 @@ pub fn probe() -> Capabilities {
 mod tests {
     use super::*;
 
-    // Helper: build a Capabilities with derived max_level.
+    // Helper: build a Capabilities with derived max_level. container_runtime
+    // and container_runtime_functional are left at their zero values (None /
+    // false) — individual tests set them via field assignment when needed.
     fn caps(nix_flakes: bool, bwrap: bool, seatbelt: bool) -> Capabilities {
         let max_level_available = derive_max_level(nix_flakes, bwrap, seatbelt);
         Capabilities {
@@ -806,6 +831,7 @@ mod tests {
             bwrap,
             seatbelt,
             container_runtime: None,
+            container_runtime_functional: false,
             agent_native: AgentNative { codex: false, claude: false },
             max_level_available,
         }
@@ -1017,6 +1043,7 @@ mod tests {
     fn test_resolve_backend_auto_prefers_podman() {
         let mut c = caps(false, true, true);
         c.container_runtime = Some("podman".to_string());
+        c.container_runtime_functional = true;
         assert_eq!(resolve_backend("auto", &c), Backend::Podman);
     }
 
@@ -1042,6 +1069,68 @@ mod tests {
         assert_eq!(resolve_backend("none", &c), Backend::None);
         // unknown → treated as auto → None here
         assert_eq!(resolve_backend("garbage", &c), Backend::None);
+    }
+
+    // ADR-004: backend_usable(Podman) requires both the runtime name AND functional flag.
+    #[test]
+    fn test_backend_usable_podman_functional_gate() {
+        // present but NOT functional → backend_usable returns false.
+        let mut c = caps(false, false, false);
+        c.container_runtime = Some("podman".to_string());
+        c.container_runtime_functional = false;
+        // backend_usable is private; exercise it via resolve_effective.
+        assert_eq!(
+            resolve_effective(Level::L1, &c, Backend::Podman),
+            (Level::L0, true),
+            "present-but-nonfunctional podman must not be usable"
+        );
+
+        // present AND functional → backend_usable returns true.
+        c.container_runtime_functional = true;
+        assert_eq!(
+            resolve_effective(Level::L1, &c, Backend::Podman),
+            (Level::L1, false),
+            "functional podman must be usable"
+        );
+    }
+
+    // ADR-004: auto selection downgrades to bwrap when podman is present-but-broken.
+    #[test]
+    fn test_resolve_backend_auto_podman_nonfunctional_falls_through_to_bwrap() {
+        let mut c = caps(false, true, false); // bwrap present
+        c.container_runtime = Some("podman".to_string());
+        c.container_runtime_functional = false; // broken rootless podman
+        assert_eq!(
+            resolve_backend("auto", &c),
+            Backend::Bwrap,
+            "auto must fall through to bwrap when podman is present-but-nonfunctional"
+        );
+    }
+
+    // ADR-004: auto selection picks podman when functional.
+    #[test]
+    fn test_resolve_backend_auto_podman_functional_picked() {
+        let mut c = caps(false, true, false);
+        c.container_runtime = Some("podman".to_string());
+        c.container_runtime_functional = true;
+        assert_eq!(
+            resolve_backend("auto", &c),
+            Backend::Podman,
+            "auto must pick podman when functional"
+        );
+    }
+
+    // ADR-004: forced backend="podman" must still return Podman even when nonfunctional.
+    #[test]
+    fn test_resolve_backend_forced_podman_ignores_functional_flag() {
+        let mut c = caps(false, true, false);
+        c.container_runtime = Some("podman".to_string());
+        c.container_runtime_functional = false; // broken, but operator forced it
+        assert_eq!(
+            resolve_backend("podman", &c),
+            Backend::Podman,
+            "forced backend=podman must be respected even when nonfunctional"
+        );
     }
 
     // AC4: L0 identity.
@@ -1179,16 +1268,19 @@ mod tests {
         );
     }
 
-    // AC7: podman needs image.
+    // AC7: podman with no image configured → uses DEFAULT_PODMAN_IMAGE.
     #[test]
-    fn test_ac7_podman_image_required() {
+    fn test_ac7_podman_no_image_uses_default() {
         let sp = spec(Level::L1, Backend::Podman, NetworkPolicy::Deny);
-        assert_eq!(
-            wrap(&sp, "cargo", &[]),
-            Err(SandboxError::PodmanImageRequired)
+        let w = wrap(&sp, "cargo", &[]).unwrap();
+        assert_eq!(w.program, "podman");
+        assert!(
+            w.args.contains(&DEFAULT_PODMAN_IMAGE.to_string()),
+            "expected DEFAULT_PODMAN_IMAGE ({DEFAULT_PODMAN_IMAGE}) in podman argv when podman_image is unset"
         );
     }
 
+    // AC7: podman with explicit image → uses specified image, not the default.
     #[test]
     fn test_ac7_podman_with_image() {
         let mut sp = spec(Level::L1, Backend::Podman, NetworkPolicy::Deny);
@@ -1347,7 +1439,12 @@ mod tests {
         let mut c = caps(false, false, false);
         c.container_runtime = Some("docker".to_string());
         assert_eq!(resolve_effective(Level::L1, &c, Backend::Podman), (Level::L0, true));
+        // podman present but NOT functional → still not usable.
         c.container_runtime = Some("podman".to_string());
+        c.container_runtime_functional = false;
+        assert_eq!(resolve_effective(Level::L1, &c, Backend::Podman), (Level::L0, true));
+        // podman present AND functional → usable.
+        c.container_runtime_functional = true;
         assert_eq!(resolve_effective(Level::L1, &c, Backend::Podman), (Level::L1, false));
     }
 }
