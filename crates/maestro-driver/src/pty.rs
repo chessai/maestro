@@ -1,33 +1,28 @@
 //! Shared low-level PTY primitives for driven sessions (ADR-006).
 //!
 //! Both the interactive [`crate::session::DrivenSession`] (prompt-on-stdin,
-//! mid-run plan echo, then supervise) and the two-phase
-//! [`crate::claude::run_claude_driven`] (prompt-as-arg, run to completion twice)
-//! build on the same primitives here:
+//! mid-run plan echo, then supervise) and the two-phase, structured
+//! [`crate::claude::run_claude_driven`] (prompt-as-arg, stream-json parsed to
+//! completion twice) build on the same primitives here:
 //!
 //! - [`PtyChild`] — opens a PTY, spawns a program in its own session /
 //!   process-group (portable-pty `setsid`s the slave), and starts a reader
 //!   thread pumping PTY output to a log file (append) + a shared in-memory
-//!   buffer while stamping `last_output_at` for the watchdog.
+//!   buffer while stamping `last_output_at` for the watchdog. Callers own the
+//!   supervision loop (kill / child-exit / watchdog); the Claude adapter also
+//!   parses the shared buffer incrementally as stream-json.
 //! - [`teardown`] — SIGTERM the child's process group, wait up to 5s, SIGKILL.
-//! - [`run_pty_command`] — the run-to-completion helper used by the Claude
-//!   adapter: spawn `program args` in `cwd`, supervise under a no-output
-//!   watchdog and an external-kill receiver, and return the captured output
-//!   plus why it ended ([`PtyRunOutcome`]).
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use rustix::process::{kill_process_group, Pid, Signal};
-
-use crate::session::KillKind;
 
 /// SIGKILL grace period after SIGTERM during teardown (ADR-006).
 pub(crate) const TERM_GRACE: Duration = Duration::from_secs(5);
@@ -148,11 +143,6 @@ impl PtyChild {
         self.shared.last_output_at.lock().unwrap().elapsed()
     }
 
-    /// Snapshot of the captured output so far.
-    pub(crate) fn output(&self) -> String {
-        String::from_utf8_lossy(&self.shared.buf.lock().unwrap()).into_owned()
-    }
-
     /// SIGTERM→SIGKILL the child's process group and reap it.
     pub(crate) fn teardown(&mut self) {
         teardown(self.child.as_mut(), self.child_pid);
@@ -240,96 +230,4 @@ pub(crate) fn teardown(child: &mut dyn Child, child_pid: Option<i32>) {
     }
     // Reap so no zombie/lingering child remains.
     let _ = child.wait();
-}
-
-/// Why a [`run_pty_command`] invocation ended.
-pub(crate) enum PtyRunOutcome {
-    /// The child exited on its own with this status code (`None` if unknown).
-    Exited(Option<i32>),
-    /// No output past the watchdog → wedged (child torn down).
-    Wedged,
-    /// External kill request honored (child torn down).
-    Killed(KillKind),
-    /// Spawn / PTY setup error.
-    SpawnError(String),
-}
-
-/// The captured output plus the terminal outcome of a run-to-completion PTY
-/// command.
-pub(crate) struct PtyRun {
-    pub(crate) output: String,
-    pub(crate) outcome: PtyRunOutcome,
-}
-
-/// Run `program args` in `cwd` under a PTY to completion, streaming output to
-/// `log_path` (append) + an in-memory buffer, resetting a no-output watchdog,
-/// and honoring an external kill via `kill_rx`. `pid_slot` is updated with the
-/// child's pid so an external [`crate::session::SessionHandle`] can target the
-/// currently-running child. Returns the captured output and why it ended.
-///
-/// `env_remove` lists env var names to strip from the child's inherited
-/// environment before spawn (ADR-006 `metered: false`).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_pty_command(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    log_path: &Path,
-    watchdog: Duration,
-    kill_rx: &Receiver<KillKind>,
-    pid_slot: &Arc<Mutex<Option<i32>>>,
-    env_remove: &[String],
-) -> PtyRun {
-    let mut pty = match PtyChild::spawn(program, args, cwd, log_path, env_remove) {
-        Ok(p) => p,
-        Err(e) => {
-            return PtyRun {
-                output: String::new(),
-                outcome: PtyRunOutcome::SpawnError(e),
-            }
-        }
-    };
-
-    // Publish the pid so the handle targets THIS phase's child.
-    *pid_slot.lock().unwrap() = pty.child_pid;
-
-    let outcome = loop {
-        // (c) external kill.
-        if let Ok(kind) = kill_rx.try_recv() {
-            pty.teardown();
-            break PtyRunOutcome::Killed(kind);
-        }
-        // (a) child exit.
-        match pty.child.try_wait() {
-            Ok(Some(status)) => {
-                break PtyRunOutcome::Exited(exit_code(&status));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                pty.teardown();
-                break PtyRunOutcome::SpawnError(format!("try_wait failed: {e}"));
-            }
-        }
-        // (b) watchdog.
-        if pty.idle() > watchdog {
-            pty.teardown();
-            break PtyRunOutcome::Wedged;
-        }
-        std::thread::sleep(POLL);
-    };
-
-    let output = pty.output();
-    // `pty` drops here: reader joined, master/writer closed.
-    PtyRun { output, outcome }
-}
-
-/// Best-effort exit code from a portable-pty exit status.
-fn exit_code(status: &portable_pty::ExitStatus) -> Option<i32> {
-    // portable-pty exposes a raw u32 exit code; success() distinguishes zero.
-    if status.success() {
-        Some(0)
-    } else {
-        // exit_code() is u32; clamp into i32 for our EndReason mapping.
-        Some(status.exit_code() as i32)
-    }
 }

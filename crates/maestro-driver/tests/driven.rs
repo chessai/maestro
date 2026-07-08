@@ -120,6 +120,7 @@ fn config(f: &Fixture, scenario: &str, watchdog: Duration) -> DrivenConfig {
         plan_marker: "PLAN:".into(),
         plan_timeout: Duration::from_secs(10),
         env_remove: vec![],
+        turn_cap: None,
     }
 }
 
@@ -299,6 +300,7 @@ exit 0
         plan_marker: "PLAN:".into(),
         plan_timeout: Duration::from_secs(10),
         env_remove: vec![TEST_VAR.to_string()],
+        turn_cap: None,
     };
 
     let (_handle, join) =

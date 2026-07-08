@@ -369,6 +369,39 @@ fn tighten_file_cap(
     Some(cap.max(1))
 }
 
+/// The default per-attempt turn budget when a spec sets none (ADR-006 / M3):
+/// mirrors the implementer's `DEFAULT_TURN_BUDGET`.
+const DEFAULT_TURN_BUDGET: u32 = 25;
+
+/// The per-attempt TURN budget the structured `claude` driven adapter enforces
+/// (ADR-004 / ADR-007). Pure given its inputs. The base budget is
+/// `spec.budget.turns` (default [`DEFAULT_TURN_BUDGET`] when unset). When
+/// tightening is ACTIVE — the SAME condition as [`tighten_file_cap`]: the
+/// containment recipe was downgraded, OR `codex_tighten` is set AND the role is
+/// a `driven_cli` role — the budget is shrunk to
+/// `floor(turns × tighten.turn_factor)`, never below 1. When tightening is not
+/// active the raw base budget is returned. Never 0.
+fn effective_turn_cap(
+    rp: &ResolvedProfile,
+    recipe: &ContainmentRecipe,
+    role: &ResolvedRole,
+    spec: &TaskSpec,
+) -> u32 {
+    let turns = spec
+        .budget
+        .turns
+        .map(|t| t.max(1) as u32)
+        .unwrap_or(DEFAULT_TURN_BUDGET);
+    let active =
+        recipe.downgraded || (rp.codex_tighten && role.kind.as_deref() == Some("driven_cli"));
+    if !active {
+        return turns;
+    }
+    let factor = rp.tighten.turn_factor.clamp(0.0, 1.0);
+    let tightened = ((turns as f64) * factor).floor() as u32;
+    tightened.max(1)
+}
+
 /// The fully-resolved containment recipe for a task (ADR-004). Computed ONCE at
 /// delegation time and reused for the whole task — escalation may raise the
 /// model but never lowers containment, so the effective level is fixed here.
@@ -774,24 +807,24 @@ fn run_worker(
             Some(&recipe.downgrade_payload()),
         );
         // Light-touch tighten (ADR-004): shrink the per-attempt turn budget by the
-        // profile's `tighten.turn_factor`. Compute + log the tightened value here.
-        // NOTE (deferred): neither per-attempt turn-budget enforcement nor the
-        // allowlist tightening (`tighten.allowlist_factor`) is wired into the M3
-        // pipeline — the driven session carries a watchdog, not a turn cap, and
-        // the gate enforces the spec allowlist verbatim. Recording the tightened
-        // budget keeps the downgrade observable until that enforcement lands.
-        if let Some(turns) = spec.budget.turns {
-            let factor = resolved_profile(state.profile_flag.as_deref())
-                .map(|rp| rp.tighten.turn_factor)
-                .unwrap_or(0.6)
-                .clamp(0.0, 1.0);
-            let tightened = ((turns as f64) * factor).floor().max(1.0) as i64;
+        // profile's `tighten.turn_factor`. Compute + log the tightened cap here.
+        // For the STRUCTURED `claude` driven adapter this cap IS enforced: the
+        // adapter hard-stops the execute phase once the observed turn count
+        // exceeds it (`effective_turn_cap` computes the same value per attempt).
+        // The generic driven path still carries a watchdog, not a turn cap.
+        if let Ok(rp) = resolved_profile(state.profile_flag.as_deref()) {
+            let requested_turns = spec
+                .budget
+                .turns
+                .map(|t| t.max(1) as u32)
+                .unwrap_or(DEFAULT_TURN_BUDGET);
+            let turn_cap = effective_turn_cap(&rp, &recipe, &role, &spec);
             tracing::info!(
                 task = %task_id,
-                requested_turns = turns,
-                tightened_turns = tightened,
-                factor,
-                "containment downgraded: tightened per-attempt turn budget (enforcement deferred)"
+                requested_turns,
+                turn_cap,
+                turn_factor = rp.tighten.turn_factor,
+                "containment downgraded: structured claude adapter will enforce a tightened turn cap"
             );
         }
         // The allowlist cap (ADR-004) IS enforced at the mechanical gate: log the
@@ -1327,6 +1360,8 @@ fn driven_prompt(spec: &TaskSpec) -> String {
 ///
 /// - `Completed` → mechanical gate + verifier tail (the CLI edited the worktree);
 /// - `PlanRejected` → terminal `failed(plan_rejected)`, zero edits (not fuel);
+/// - `TurnBudgetExceeded` → terminal `failed(turn_budget_exceeded)` with the cap
+///   + a partial-diff snapshot (the structured adapter hard-stopped mid-session);
 /// - `Wedged` → terminal `failed(session_wedged)` with a partial-diff snapshot;
 /// - `Killed(Human|Advisor)` → `interrupted` + terminal `failed(interrupted_*)`
 ///   with a partial-diff snapshot;
@@ -1407,6 +1442,11 @@ fn run_driven_attempt(
         Arc::new(AnthropicPlanChecker::new(role.base_url.clone()))
     };
 
+    // The per-attempt turn cap the structured `claude` adapter enforces (ADR-004
+    // / ADR-007): the tightened turn budget when tightening is active, else the
+    // raw budget. The generic driven path ignores it.
+    let turn_cap = effective_turn_cap(rp, recipe, role, spec);
+
     let watchdog = watchdog_duration(rp);
     let config = DrivenConfig {
         program,
@@ -1418,6 +1458,7 @@ fn run_driven_attempt(
         plan_marker: "PLAN:".to_string(),
         // Give the plan echo a little slack over the watchdog.
         plan_timeout: watchdog,
+        turn_cap: Some(turn_cap),
         // Strip provider API keys so a subscription-authenticated CLI
         // (claude, codex) uses its subscription (flat-rate) instead of
         // accidentally billing per-token via a key in the daemon's env
@@ -1466,15 +1507,30 @@ fn run_driven_attempt(
     };
 
     let turns = Some(result.turns as i64);
+    // The structured `claude` adapter reports real token usage from its
+    // stream-json `result` events (ADR-006); the generic driven path leaves
+    // these `None`. When present, driven sessions become metered in the journal.
+    let tokens_in = result.tokens_in.map(|t| t as i64);
+    let tokens_out = result.tokens_out.map(|t| t as i64);
+    if let Some(cost) = result.cost_usd {
+        tracing::info!(task = %task_id, attempt, cost_usd = cost, "driven session reported cost");
+    }
 
     // A capped partial-diff snapshot for kill/wedge forensics (ADR-006).
     let snapshot = || cap_diff(&worktree::snapshot_diff(&worktree_path, base_ref));
 
     match result.reason {
         EndReason::Completed => {
-            // The CLI exited on its own; subscription CLIs are unmetered
-            // (ADR-006 `metered: false`) → tokens None.
-            finish_session(state, session_id.as_deref(), ExitStatus::Ok, turns, None, None);
+            // The structured adapter reports tokens (metered); the generic path
+            // reports None (ADR-006 `metered: false`).
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Ok,
+                turns,
+                tokens_in,
+                tokens_out,
+            );
             emit(state, task_id, EventKind::ImplFinished, None);
             run_gate_and_verify(
                 state,
@@ -1492,7 +1548,14 @@ fn run_driven_attempt(
         EndReason::PlanRejected { reason } => {
             // Terminal, ZERO edits (driver killed before edits) — NOT escalation
             // fuel; treated like a scope violation (ADR-003). Do not commit.
-            finish_session(state, session_id.as_deref(), ExitStatus::Error, turns, None, None);
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Error,
+                turns,
+                tokens_in,
+                tokens_out,
+            );
             let payload = failure_payload(
                 "plan_rejected",
                 "driven CLI plan-echo rejected the plan before any edits",
@@ -1504,7 +1567,14 @@ fn run_driven_attempt(
         }
         EndReason::Wedged => {
             let partial_diff = snapshot();
-            finish_session(state, session_id.as_deref(), ExitStatus::Wedged, turns, None, None);
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Wedged,
+                turns,
+                tokens_in,
+                tokens_out,
+            );
             let payload = failure_payload(
                 "session_wedged",
                 "driven CLI produced no output past the watchdog timeout",
@@ -1514,9 +1584,47 @@ fn run_driven_attempt(
             worktree::remove(repo, &worktree_path);
             Ok(AttemptOutcome::ScopeViolation)
         }
+        EndReason::TurnBudgetExceeded => {
+            // The execute phase exceeded the per-attempt turn cap and was
+            // hard-stopped mid-session (ADR-004 / ADR-007). TERMINAL — a budget
+            // stop is not escalation fuel; treated like a scope violation, same
+            // as Wedged. The worktree may hold partial edits: snapshot them for
+            // forensics, then remove the worktree.
+            let partial_diff = snapshot();
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Error,
+                turns,
+                tokens_in,
+                tokens_out,
+            );
+            let message = format!(
+                "driven CLI exceeded its per-attempt turn cap of {turn_cap} and was hard-stopped"
+            );
+            let payload = failure_payload(
+                "turn_budget_exceeded",
+                &message,
+                Some(serde_json::json!({
+                    "reason": "turn_budget_exceeded",
+                    "cap": turn_cap,
+                    "partial_diff": partial_diff,
+                })),
+            );
+            emit(state, task_id, EventKind::Failed, Some(&payload));
+            worktree::remove(repo, &worktree_path);
+            Ok(AttemptOutcome::ScopeViolation)
+        }
         EndReason::Killed(kind) => {
             let partial_diff = snapshot();
-            finish_session(state, session_id.as_deref(), ExitStatus::Killed, turns, None, None);
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Killed,
+                turns,
+                tokens_in,
+                tokens_out,
+            );
             let (fail_kind, kind_label) = match kind {
                 KillKind::Human => ("interrupted_human", "human"),
                 KillKind::Advisor => ("interrupted_advisor", "advisor"),
@@ -1540,7 +1648,14 @@ fn run_driven_attempt(
             Ok(AttemptOutcome::ScopeViolation)
         }
         EndReason::Failed(msg) => {
-            finish_session(state, session_id.as_deref(), ExitStatus::Error, turns, None, None);
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Error,
+                turns,
+                tokens_in,
+                tokens_out,
+            );
             let payload = failure_payload("internal_error", &msg, None);
             emit(state, task_id, EventKind::Failed, Some(&payload));
             worktree::remove(repo, &worktree_path);
@@ -2200,6 +2315,65 @@ roles.tier1 = { model = "qwen", kind = "openai_compat", base_url = "http://local
         assert_eq!(
             tighten_file_cap(&rp_quarter, &recipe_with_downgraded(true), &anthropic, &spec_with_allowlist(3)),
             Some(1)
+        );
+    }
+
+    /// A spec fixture carrying an explicit per-attempt turn budget.
+    fn spec_with_turns(turns: Option<i64>) -> TaskSpec {
+        let mut s = spec(vec![crit("AC1", "cargo test", CriterionKind::Command)]);
+        s.budget.turns = turns;
+        s
+    }
+
+    // ADR-004 / ADR-007: effective_turn_cap — the enforced per-attempt turn cap
+    // for the structured claude driven adapter.
+    #[test]
+    fn effective_turn_cap_rules() {
+        // Default tighten factor is 0.6.
+        let rp = ResolvedProfile::merge(&Default::default(), None);
+        assert_eq!(rp.tighten.turn_factor, 0.6);
+        assert!(!rp.codex_tighten);
+
+        let anthropic = role_with_kind(None);
+        let driven = role_with_kind(Some("driven_cli"));
+
+        // NOT tightening → raw budget (30 → 30).
+        assert_eq!(
+            effective_turn_cap(&rp, &recipe_with_downgraded(false), &driven, &spec_with_turns(Some(30))),
+            30
+        );
+
+        // Unset budget → DEFAULT_TURN_BUDGET (25), not tightened → 25.
+        assert_eq!(
+            effective_turn_cap(&rp, &recipe_with_downgraded(false), &anthropic, &spec_with_turns(None)),
+            DEFAULT_TURN_BUDGET
+        );
+
+        // Downgraded → floor(30 × 0.6) = 18.
+        assert_eq!(
+            effective_turn_cap(&rp, &recipe_with_downgraded(true), &anthropic, &spec_with_turns(Some(30))),
+            18
+        );
+
+        // codex_tighten + driven_cli role → tightened even without a downgrade:
+        // floor(25 × 0.6) = 15.
+        let mut rp_codex = rp.clone();
+        rp_codex.codex_tighten = true;
+        assert_eq!(
+            effective_turn_cap(&rp_codex, &recipe_with_downgraded(false), &driven, &spec_with_turns(Some(25))),
+            15
+        );
+
+        // codex_tighten + NON-driven role → NOT active → raw budget.
+        assert_eq!(
+            effective_turn_cap(&rp_codex, &recipe_with_downgraded(false), &anthropic, &spec_with_turns(Some(25))),
+            25
+        );
+
+        // Min-1 clamp: tiny budget × factor floors to 0 → clamped to 1.
+        assert_eq!(
+            effective_turn_cap(&rp, &recipe_with_downgraded(true), &anthropic, &spec_with_turns(Some(1))),
+            1
         );
     }
 }

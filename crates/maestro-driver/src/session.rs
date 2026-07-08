@@ -50,12 +50,18 @@ pub enum EndReason {
     Killed(KillKind),
     /// Watchdog fired: no output past the configured timeout.
     Wedged,
+    /// The execute phase exceeded the per-attempt turn cap and was hard-stopped
+    /// mid-session (structured stream-json adapter only). Terminal, not fuel.
+    TurnBudgetExceeded,
     /// Spawn/PTY/other error, or a non-zero CLI exit.
     Failed(String),
 }
 
 /// The outcome of a driven session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: `cost_usd: Option<f64>` carries a float; `PartialEq` suffices for
+/// the test assertions and the daemon never hashes a result.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DrivenResult {
     /// Terminal reason.
     pub reason: EndReason,
@@ -63,6 +69,13 @@ pub struct DrivenResult {
     pub log_path: PathBuf,
     /// Best-effort turn count (plan echo counts as turn 1).
     pub turns: u32,
+    /// Input tokens the driven session reported (summed across phases), when
+    /// known. `None` for unmetered generic sessions (ADR-006).
+    pub tokens_in: Option<u64>,
+    /// Output tokens the driven session reported, when known.
+    pub tokens_out: Option<u64>,
+    /// Total cost (USD) the driven session reported, when known.
+    pub cost_usd: Option<f64>,
 }
 
 /// Configuration for a single driven session.
@@ -91,6 +104,11 @@ pub struct DrivenConfig {
     /// accidentally billing per-token via an API key that happens to be in
     /// the daemon's environment.
     pub env_remove: Vec<String>,
+    /// Per-attempt turn budget the structured (stream-json) claude adapter
+    /// enforces in its execute phase by hard-stopping mid-session once the
+    /// observed assistant-turn count exceeds this cap. `None` = no cap. The
+    /// generic [`DrivenSession`] path ignores this field.
+    pub turn_cap: Option<u32>,
 }
 
 /// Bound on plan-echo lines read after the marker line.
@@ -212,6 +230,9 @@ fn run_session(
         reason,
         log_path,
         turns,
+        tokens_in: None,
+        tokens_out: None,
+        cost_usd: None,
     }
 }
 
@@ -254,6 +275,9 @@ fn failed(log_path: PathBuf, msg: String) -> DrivenResult {
         reason: EndReason::Failed(msg),
         log_path,
         turns: 0,
+        tokens_in: None,
+        tokens_out: None,
+        cost_usd: None,
     }
 }
 

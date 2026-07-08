@@ -270,10 +270,12 @@ fn m3_driven_sessions_end_to_end() {
         "echo 'PLAN: create the file'\nsleep 30",
     );
 
-    // AC8 (claude adapter): fake "claude" CLI that keys off --permission-mode.
-    // plan phase → print a plan (contains "create"); acceptEdits phase → write file.
-    // We detect the mode by scanning $@ for --permission-mode <mode>.
-    // The script produces output in both phases so the watchdog never fires.
+    // AC8 (claude adapter): fake "claude" CLI that keys off --permission-mode and
+    // emits STRUCTURED stream-json (the shape `run_claude_driven` parses): a
+    // `system` init, one `assistant` event carrying the plan / work text, then a
+    // metered `result`. plan phase → a "create" plan (edits nothing); acceptEdits
+    // phase → write the file + a `result`. Output in both phases keeps the
+    // watchdog quiet.
     let claude_fake = write_fake_cli(
         &scripts,
         "fake-claude.sh",
@@ -286,12 +288,47 @@ for arg in "$@"; do
     prev="$arg"
 done
 if [ "$mode" = "plan" ]; then
-    printf 'I will create src/claude_output.rs with a placeholder function.\n'
+    printf '{"type":"system","subtype":"init","session_id":"s1"}\n'
+    printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"PLAN: I will create src/claude_output.rs with a placeholder function."}]}}\n'
+    printf '{"type":"result","num_turns":1,"total_cost_usd":0.01,"usage":{"input_tokens":11,"output_tokens":7}}\n'
 elif [ "$mode" = "acceptEdits" ]; then
+    printf '{"type":"system","subtype":"init","session_id":"s2"}\n'
+    printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"creating the file"}]}}\n'
     mkdir -p src
     printf 'pub fn claude_output() {}\n' > src/claude_output.rs
     sync
-    printf 'done\n'
+    printf '{"type":"result","num_turns":2,"total_cost_usd":0.02,"usage":{"input_tokens":13,"output_tokens":9}}\n'
+fi
+exit 0"#,
+    );
+
+    // AC8b (claude adapter, turn cap): fake execute phase emits MANY assistant
+    // turns then sleeps (no timely exit), so the tightened per-attempt turn cap
+    // trips and the session ends `turn_budget_exceeded`. The plan phase still
+    // emits a "create" plan so the plan gate passes.
+    let claude_turncap_fake = write_fake_cli(
+        &scripts,
+        "fake-claude-turncap.sh",
+        r#"mode=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "--permission-mode" ]; then
+        mode="$arg"
+    fi
+    prev="$arg"
+done
+if [ "$mode" = "plan" ]; then
+    printf '{"type":"system","subtype":"init","session_id":"s1"}\n'
+    printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"PLAN: I will create the output file."}]}}\n'
+    printf '{"type":"result","num_turns":1,"total_cost_usd":0.01,"usage":{"input_tokens":11,"output_tokens":7}}\n'
+elif [ "$mode" = "acceptEdits" ]; then
+    printf '{"type":"system","subtype":"init","session_id":"s2"}\n'
+    i=1
+    while [ "$i" -le 40 ]; do
+        printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"turn %s"}]}}\n' "$i"
+        i=$((i+1))
+    done
+    sleep 3000
 fi
 exit 0"#,
     );
@@ -324,11 +361,17 @@ roles.verifier_floor = "mock"
 [profiles.claude_adapter]
 roles.tier0 = {{ model = "mock", kind = "driven_cli", command = "bash", args = ["{claude}"], adapter = "claude" }}
 roles.verifier_floor = "mock"
+
+[profiles.claude_turncap]
+codex_tighten = true
+roles.tier0 = {{ model = "mock", kind = "driven_cli", command = "bash", args = ["{claude_turncap}"], adapter = "claude" }}
+roles.verifier_floor = "mock"
 "#,
             ok = ok_fake,
             reject = reject_fake,
             sleep = sleep_fake,
             claude = claude_fake,
+            claude_turncap = claude_turncap_fake,
         ),
     )
     .unwrap();
