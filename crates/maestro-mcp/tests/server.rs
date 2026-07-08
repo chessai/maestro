@@ -133,6 +133,7 @@ fn ac6_delegate_forwards_request_and_appends_inbox() {
                 ts: "2026-07-07T00:00:00Z".into(),
                 kind: "verify_passed".into(),
                 summary: "task T1 verified".into(),
+                detail: None,
             }],
         },
     ];
@@ -808,4 +809,87 @@ fn ac5_fetch_extract_daemon_error_is_tool_error() {
         .as_str()
         .unwrap()
         .contains("model_unavailable"));
+}
+
+// ADR-007: append_inbox renders `detail` (inlined payload) beneath the summary
+// line when an item carries `detail: Some(...)`.
+#[test]
+fn append_inbox_renders_detail_when_present() {
+    let script = vec![
+        Response::RegisterAdvisor {
+            advisor_session_id: "adv-1m".into(),
+        },
+        Response::Delegate {
+            task_id: "T2".into(),
+        },
+        // Inbox with one item carrying a detail payload and one without.
+        Response::Inbox {
+            items: vec![
+                InboxItem {
+                    event_id: "E2".into(),
+                    task_id: "T2".into(),
+                    ts: "2026-07-08T00:00:00Z".into(),
+                    kind: "failed".into(),
+                    summary: "failed — my task".into(),
+                    detail: Some(r#"{"kind":"verification_failed"}"#.into()),
+                },
+                InboxItem {
+                    event_id: "E3".into(),
+                    task_id: "T2".into(),
+                    ts: "2026-07-08T00:00:01Z".into(),
+                    kind: "verify_passed".into(),
+                    summary: "verify_passed — my task".into(),
+                    detail: None,
+                },
+            ],
+        },
+    ];
+    let (fake, _rec) = FakeTransport::new(script);
+    let mut server = McpServer::new(Box::new(fake), None);
+
+    let line = json!({
+        "jsonrpc": "2.0",
+        "id": 60,
+        "method": "tools/call",
+        "params": {
+            "name": "delegate",
+            "arguments": {
+                "repo_path": "/repo/bar",
+                "spec": {
+                    "title": "my task",
+                    "tier": 0,
+                    "base_ref": "main",
+                    "instructions": "do it",
+                    "acceptance_criteria": [
+                        { "id": "AC1", "check": "true", "kind": "command" }
+                    ]
+                }
+            }
+        }
+    })
+    .to_string();
+
+    let v = parse(&server.handle_line(&line).unwrap());
+    assert_eq!(v["id"], json!(60));
+    assert_ne!(v["result"]["isError"], json!(true));
+
+    let text = v["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+
+    // The detail payload must appear beneath its summary line.
+    assert!(
+        text.contains("verification_failed"),
+        "rendered text must include the inlined payload: {text}"
+    );
+    // The ↳ prefix must separate detail from the summary line.
+    assert!(
+        text.contains("↳"),
+        "rendered text must use the ↳ prefix for detail: {text}"
+    );
+    // The item without detail must appear but NOT with a ↳ line.
+    assert!(
+        text.contains("verify_passed — my task"),
+        "non-detail item summary must appear: {text}"
+    );
 }

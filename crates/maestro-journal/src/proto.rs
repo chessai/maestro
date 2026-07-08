@@ -153,6 +153,10 @@ pub struct InboxItem {
     pub kind: String,
     /// One-line human summary for the advisor (daemon-composed).
     pub summary: String,
+    /// Full event payload, inlined when `advisor.context = "1m"` (ADR-007).
+    /// `None` in `"standard"` mode or when the event carries no payload.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// One row of the `ps` read-model (ADR-006), presented to `maestro ps`.

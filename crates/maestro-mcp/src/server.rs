@@ -428,6 +428,12 @@ fn append_inbox(result: &mut Value, items: &[InboxItem]) {
         for item in items {
             s.push_str("\n- ");
             s.push_str(&item.summary);
+            if let Some(d) = &item.detail {
+                if !d.is_empty() {
+                    s.push_str("\n  ↳ ");
+                    s.push_str(d);
+                }
+            }
         }
         s
     };

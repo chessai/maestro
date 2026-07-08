@@ -389,3 +389,133 @@ fn shim_cache_roundtrip() {
         .unwrap()
         .is_none());
 }
+
+// ADR-007: advisor_context getter returns the stored context; None for unknown advisor.
+#[test]
+fn advisor_context_getter_returns_stored_value_or_none() {
+    let j = Journal::open_in_memory().unwrap();
+    let adv_standard = j.create_advisor("personal", "mock", "standard").unwrap();
+    let adv_1m = j.create_advisor("work", "mock", "1m").unwrap();
+
+    assert_eq!(
+        j.advisor_context(&adv_standard).unwrap().as_deref(),
+        Some("standard")
+    );
+    assert_eq!(
+        j.advisor_context(&adv_1m).unwrap().as_deref(),
+        Some("1m")
+    );
+    // Unknown advisor → None (not an error).
+    assert_eq!(j.advisor_context("nonexistent-id").unwrap(), None);
+}
+
+// ADR-007: advisor_inbox_since with inline_detail=true → detail is Some(payload);
+//          with inline_detail=false → detail is None.
+#[test]
+fn advisor_inbox_since_inline_detail_mode() {
+    let j = Journal::open_in_memory().unwrap();
+    let adv = j.create_advisor("work", "mock", "1m").unwrap();
+    let spec = serde_json::json!({
+        "title": "inline test",
+        "tier": 0,
+        "base_ref": "main",
+        "instructions": "do it",
+        "acceptance_criteria": [{ "id": "AC1", "check": "true", "kind": "command" }],
+    })
+    .to_string();
+    let task = j
+        .create_task(
+            &adv,
+            Tier::T0,
+            "mock",
+            ContainmentLevel::L0,
+            &spec,
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Append an event WITH a JSON payload (a `failed` event with a kind key).
+    let payload = serde_json::json!({ "kind": "verification_failed", "outcome": "abandoned" })
+        .to_string();
+    j.append_event(&task, EventKind::Failed, Some(&payload)).unwrap();
+
+    // Append an event WITHOUT a payload.
+    j.append_event(&task, EventKind::Created, None).unwrap();
+
+    // inline_detail = true → failed item carries detail, created item has None.
+    let items_inlined = j.advisor_inbox_since(&adv, None, true).unwrap();
+    assert_eq!(items_inlined.len(), 2);
+
+    let failed_item = &items_inlined[0];
+    assert_eq!(failed_item.kind, "failed");
+    assert_eq!(
+        failed_item.detail.as_deref(),
+        Some(payload.as_str()),
+        "inlined mode must carry the raw payload"
+    );
+
+    let created_item = &items_inlined[1];
+    assert_eq!(created_item.kind, "created");
+    assert!(
+        created_item.detail.is_none(),
+        "event with no payload has detail=None even in inlined mode"
+    );
+
+    // inline_detail = false → both items have detail=None.
+    let items_standard = j.advisor_inbox_since(&adv, None, false).unwrap();
+    assert_eq!(items_standard.len(), 2);
+    for item in &items_standard {
+        assert!(
+            item.detail.is_none(),
+            "standard mode: detail must be None for every item (kind={})",
+            item.kind
+        );
+    }
+}
+
+// ADR-007: the 8000-char truncation is char-boundary-safe for multi-byte content.
+#[test]
+fn advisor_inbox_since_truncates_large_payload_at_char_boundary() {
+    let j = Journal::open_in_memory().unwrap();
+    let adv = j.create_advisor("work", "mock", "1m").unwrap();
+    let spec = serde_json::json!({
+        "title": "truncate test", "tier": 0, "base_ref": "main",
+        "instructions": "x",
+        "acceptance_criteria": [{ "id": "AC1", "check": "true", "kind": "command" }],
+    })
+    .to_string();
+    let task = j
+        .create_task(
+            &adv,
+            Tier::T0,
+            "mock",
+            ContainmentLevel::L0,
+            &spec,
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Build a payload that exceeds 8000 bytes: a JSON string with 9000 'a's.
+    // Each 'a' is 1 byte, so len() == 9000 > 8000 and the truncation triggers.
+    let big_payload = format!("\"{}\"", "a".repeat(9000));
+    assert!(big_payload.len() > 8000);
+
+    j.append_event(&task, EventKind::Iterating, Some(&big_payload)).unwrap();
+
+    let items = j.advisor_inbox_since(&adv, None, true).unwrap();
+    assert_eq!(items.len(), 1);
+    let detail = items[0].detail.as_deref().expect("detail must be Some");
+    assert!(
+        detail.len() <= 8000,
+        "truncated detail must not exceed 8000 bytes (len={})",
+        detail.len()
+    );
+    // Must be valid UTF-8 (no partial multi-byte splits).
+    assert!(std::str::from_utf8(detail.as_bytes()).is_ok(), "must be valid UTF-8");
+}

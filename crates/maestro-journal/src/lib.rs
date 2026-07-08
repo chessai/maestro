@@ -702,17 +702,38 @@ impl Journal {
         Ok(out)
     }
 
+    /// Look up the `advisor_context` column for an advisor row. Returns `None`
+    /// if the advisor does not exist (unknown id). This is used by the daemon to
+    /// decide whether to inline event payloads in the inbox (ADR-007).
+    pub fn advisor_context(&self, advisor_session_id: &str) -> Result<Option<String>> {
+        let ctx: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT advisor_context FROM advisors WHERE advisor_session_id = ?1",
+                [advisor_session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(ctx)
+    }
+
     /// Inbox events for an advisor since `after_event_id` (exclusive), across all
     /// of that advisor's tasks, ordered by `event_id` (ULID / time order). The
     /// daemon holds the per-advisor cursor in memory and advances it on drain.
+    ///
+    /// When `inline_detail` is `true` the full event payload is included in each
+    /// item's `detail` field (truncated to 8000 chars, char-boundary safe). When
+    /// `false`, `detail` is always `None`. This is the passive inbox only —
+    /// `journal_query` (an explicit pull) is unchanged (ADR-007).
     pub fn advisor_inbox_since(
         &self,
         advisor_session_id: &str,
         after_event_id: Option<&str>,
+        inline_detail: bool,
     ) -> Result<Vec<crate::proto::InboxItem>> {
         let cursor = after_event_id.unwrap_or("");
         let mut stmt = self.conn.prepare(
-            "SELECT e.event_id, e.task_id, e.ts, e.kind, t.spec
+            "SELECT e.event_id, e.task_id, e.ts, e.kind, t.spec, e.payload
              FROM events e JOIN tasks t ON t.task_id = e.task_id
              WHERE t.advisor_session_id = ?1 AND e.event_id > ?2
              ORDER BY e.event_id ASC",
@@ -724,11 +745,12 @@ impl Journal {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (event_id, task_id, ts, kind, spec_json) = row?;
+            let (event_id, task_id, ts, kind, spec_json, payload) = row?;
             let title = serde_json::from_str::<serde_json::Value>(&spec_json)
                 .ok()
                 .and_then(|v| v.get("title").and_then(|t| t.as_str()).map(String::from))
@@ -738,12 +760,32 @@ impl Journal {
             } else {
                 format!("{kind} — {title}")
             };
+            // Inline the payload under "1m" context; truncate defensively to a
+            // char boundary so we never split a multi-byte character.
+            let detail = if inline_detail {
+                payload.filter(|p| !p.is_empty()).map(|p| {
+                    const CAP: usize = 8000;
+                    if p.len() <= CAP {
+                        p
+                    } else {
+                        // Walk back from the cap to a char boundary.
+                        let mut end = CAP;
+                        while !p.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        p[..end].to_string()
+                    }
+                })
+            } else {
+                None
+            };
             out.push(crate::proto::InboxItem {
                 event_id,
                 task_id,
                 ts,
                 kind,
                 summary,
+                detail,
             });
         }
         Ok(out)

@@ -831,15 +831,27 @@ fn failure_kind_str(e: &DelegateError) -> &'static str {
 }
 
 /// `DrainInbox`: return the advisor's inbox events since the in-memory cursor,
-/// then advance the cursor to the last returned event_id.
+/// then advance the cursor to the last returned event_id. When the advisor's
+/// `advisor_context` is `"1m"`, event payloads are inlined into each item's
+/// `detail` field; any other value (including `"standard"` or absent) delivers
+/// summary-only items (ADR-007).
 fn drain_inbox(state: &SharedState, advisor_session_id: &str) -> Response {
     let cursor = {
         let cursors = state.inbox_cursors.lock().expect("inbox cursors poisoned");
         cursors.get(advisor_session_id).cloned()
     };
+    // Resolve the advisor's context to determine inline mode.
+    let inline_detail = {
+        let j = state.delegation.journal.lock().expect("journal mutex poisoned");
+        match j.advisor_context(advisor_session_id) {
+            Ok(ctx) => ctx.as_deref() == Some("1m"),
+            // Unknown advisor or DB error → default to no inlining.
+            Err(_) => false,
+        }
+    };
     let items = {
         let j = state.delegation.journal.lock().expect("journal mutex poisoned");
-        j.advisor_inbox_since(advisor_session_id, cursor.as_deref())
+        j.advisor_inbox_since(advisor_session_id, cursor.as_deref(), inline_detail)
     };
     match items {
         Ok(mut items) => {
@@ -867,6 +879,7 @@ fn drain_inbox(state: &SharedState, advisor_session_id: &str) -> Response {
                         summary: format!(
                             "today: {tin} in / {tout} out tokens across {sessions} sessions"
                         ),
+                        detail: None,
                     });
                 }
             }
