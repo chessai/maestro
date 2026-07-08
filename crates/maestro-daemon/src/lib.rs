@@ -12,6 +12,7 @@ pub mod delegate;
 pub mod gate;
 pub mod resolve;
 pub mod shim;
+pub mod startup;
 pub mod verify_checkout;
 pub mod worktree;
 
@@ -153,6 +154,11 @@ impl Server {
         let machine_cap = resolve_machine_cap(opts.profile.as_deref());
         let delegation =
             DelegationState::new(journal, machine_cap, opts.profile.clone());
+
+        // 5a. Reconcile orphaned in-flight tasks from a prior daemon instance
+        //     BEFORE serving begins (ADR-006). Any task in a non-terminal state
+        //     was being driven by the dead prior process.
+        startup::reconcile_orphaned_tasks(&delegation.journal);
         let state = Arc::new(SharedState {
             delegation,
             inbox_cursors: Mutex::new(HashMap::new()),
