@@ -143,6 +143,32 @@ pub fn run_search(
     }
 }
 
+/// Truncate an [`ExtractionField`]'s verbatim to at most `cap_chars` Unicode
+/// scalar values (chars). If truncation occurs the `char_offset` end is updated
+/// to reflect the shorter byte span (offsets are byte-based; the truncated
+/// string is a prefix of the original verbatim so its byte length is the new
+/// span width). A `cap_chars` of 0 means unlimited — never truncate to empty.
+fn cap_field(mut field: maestro_shim::ExtractionField, cap_chars: usize) -> maestro_shim::ExtractionField {
+    if cap_chars == 0 {
+        return field;
+    }
+    let char_count = field.verbatim.chars().count();
+    if char_count <= cap_chars {
+        return field;
+    }
+    // Find the byte boundary after `cap_chars` chars (char-safe truncation).
+    let byte_end = field
+        .verbatim
+        .char_indices()
+        .nth(cap_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(field.verbatim.len());
+    field.verbatim.truncate(byte_end);
+    // Update the offset end: start is unchanged; new end = start + new byte length.
+    field.char_offset[1] = field.char_offset[0] + field.verbatim.len();
+    field
+}
+
 /// `fetch_extract` executor (ADR-005). See the module docs for the contract.
 ///
 /// 1. Cache lookup by `(url, schema_hash)`; a fresh (<24h) hit returns the cached
@@ -151,7 +177,9 @@ pub fn run_search(
 /// 3. `model.extract` → `ModelUnavailable` → `extraction model unavailable`.
 /// 4. `locate_offsets` → a verbatim not found in the content (`VerbatimNotFound`)
 ///    is **rejected** (never cached); found verbatims get daemon-computed offsets.
-/// 5. Valid → build + cache the [`Extraction`], journal the session, return it.
+/// 5. Each located verbatim is capped to `cap_chars` Unicode scalar values
+///    (ADR-005 / ADR-007: `shim.excerpt_cap_chars`). `cap_chars = 0` → no cap.
+/// 6. Valid → build + cache the [`Extraction`], journal the session, return it.
 #[allow(clippy::too_many_arguments)]
 pub fn run_fetch_extract(
     journal: &Arc<Mutex<Journal>>,
@@ -161,6 +189,7 @@ pub fn run_fetch_extract(
     model_name: &str,
     url: &str,
     schema_fields: &[String],
+    cap_chars: usize,
 ) -> Response {
     let h = schema_hash(schema_fields);
     let now = maestro_journal::now_iso8601();
@@ -234,7 +263,7 @@ pub fn run_fetch_extract(
     // 4. Locate each verbatim in the content (daemon computes offsets) — the
     //    exit criterion. A verbatim not present in the page is a hallucination:
     //    reject it and do NOT cache.
-    let fields = match locate_offsets(&content, &raws) {
+    let located = match locate_offsets(&content, &raws) {
         Ok(f) => f,
         Err(ShimError::VerbatimNotFound { field }) => {
             finish_shim_session(journal, session_id.as_deref(), ExitStatus::Error);
@@ -250,7 +279,13 @@ pub fn run_fetch_extract(
         }
     };
 
-    // 5. Valid: build the extraction, cache it, finalize the session, return it.
+    // 5. Apply the per-field excerpt cap (ADR-005 / ADR-007: `shim.excerpt_cap_chars`).
+    //    Truncation is char-safe; offsets are adjusted to reflect the shorter span.
+    //    The cache is populated with already-capped excerpts so cache hits stay
+    //    within the cap without a second pass.
+    let fields: Vec<_> = located.into_iter().map(|f| cap_field(f, cap_chars)).collect();
+
+    // 6. Valid: build the extraction, cache it, finalize the session, return it.
     let extraction = Extraction {
         url: url.to_string(),
         retrieved_at: now.clone(),
@@ -428,6 +463,7 @@ mod tests {
             "claude-haiku-4-5",
             "https://example.com",
             &schema,
+            0, // no cap
         );
         match resp {
             Response::Error { message } => {
@@ -480,6 +516,7 @@ mod tests {
             "claude-haiku-4-5",
             "https://example.com",
             &schema,
+            0, // no cap
         );
         let v1 = match r1 {
             Response::Extraction { extraction } => extraction,
@@ -509,6 +546,7 @@ mod tests {
             "claude-haiku-4-5",
             "https://example.com",
             &schema,
+            0, // no cap
         );
         let v2 = match r2 {
             Response::Extraction { extraction } => extraction,
@@ -564,6 +602,7 @@ mod tests {
             "claude-haiku-4-5",
             "https://example.com",
             &schema,
+            0, // no cap
         );
         assert!(matches!(resp, Response::Extraction { .. }));
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "stale entry must refetch");
@@ -597,6 +636,7 @@ mod tests {
             "claude-haiku-4-5",
             "https://example.com",
             &["f".to_string()],
+            0, // no cap
         );
         match resp {
             Response::Error { message } => {
@@ -604,5 +644,209 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    // ADR-005 / ADR-007: excerpt_cap_chars enforcement.
+    // A verbatim longer than cap_chars is truncated to exactly cap_chars chars,
+    // the returned excerpt is a prefix of the original, and the char_offset span
+    // length (in bytes) equals the truncated verbatim's byte length.
+    #[test]
+    fn excerpt_cap_truncates_long_verbatim() {
+        let j = journal();
+        let adv = advisor(&j);
+        // Content with a long span that will be returned as verbatim by the model.
+        let long = "abcdefghij"; // 10 ASCII chars
+        let content = long.to_string();
+        let fetcher = CountingFetcher {
+            content: content.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let model = CountingModel {
+            raws: vec![RawExtraction {
+                field: "body".to_string(),
+                verbatim: long.to_string(), // full 10 chars
+            }],
+            calls: AtomicUsize::new(0),
+        };
+        let schema = vec!["body".to_string()];
+        let cap = 5usize;
+        let resp = run_fetch_extract(
+            &j,
+            &adv,
+            &fetcher,
+            &model,
+            "claude-haiku-4-5",
+            "https://example.com/cap",
+            &schema,
+            cap,
+        );
+        let extraction = match resp {
+            Response::Extraction { extraction } => extraction,
+            other => panic!("expected Extraction, got {other:?}"),
+        };
+        let extractions = extraction.get("extractions").and_then(|e| e.as_array()).unwrap();
+        assert_eq!(extractions.len(), 1);
+        let verbatim = extractions[0].get("verbatim").and_then(|v| v.as_str()).unwrap();
+        // The returned verbatim must be exactly cap chars long and a prefix of original.
+        assert_eq!(
+            verbatim.chars().count(),
+            cap,
+            "verbatim must be truncated to exactly cap_chars={cap} chars"
+        );
+        assert!(
+            long.starts_with(verbatim),
+            "truncated verbatim must be a prefix of the original"
+        );
+        // The char_offset span byte-length must equal the truncated verbatim's byte-length.
+        let off = extractions[0].get("char_offset").and_then(|o| o.as_array()).unwrap();
+        let start = off[0].as_u64().unwrap() as usize;
+        let end = off[1].as_u64().unwrap() as usize;
+        assert_eq!(
+            end - start,
+            verbatim.len(),
+            "char_offset span byte-length must match truncated verbatim byte-length"
+        );
+    }
+
+    // A verbatim shorter than cap_chars is returned unchanged.
+    #[test]
+    fn excerpt_cap_leaves_short_verbatim_unchanged() {
+        let j = journal();
+        let adv = advisor(&j);
+        let content = "Hello world".to_string();
+        let fetcher = CountingFetcher {
+            content: content.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let model = CountingModel {
+            raws: vec![RawExtraction {
+                field: "greeting".to_string(),
+                verbatim: "Hello".to_string(), // 5 chars
+            }],
+            calls: AtomicUsize::new(0),
+        };
+        let schema = vec!["greeting".to_string()];
+        let resp = run_fetch_extract(
+            &j,
+            &adv,
+            &fetcher,
+            &model,
+            "claude-haiku-4-5",
+            "https://example.com/short",
+            &schema,
+            100, // cap well above verbatim length
+        );
+        let extraction = match resp {
+            Response::Extraction { extraction } => extraction,
+            other => panic!("expected Extraction, got {other:?}"),
+        };
+        let extractions = extraction.get("extractions").and_then(|e| e.as_array()).unwrap();
+        assert_eq!(
+            extractions[0].get("verbatim").and_then(|v| v.as_str()),
+            Some("Hello"),
+            "short verbatim must be returned unchanged"
+        );
+        let off = extractions[0].get("char_offset").and_then(|o| o.as_array()).unwrap();
+        assert_eq!(off[0].as_u64(), Some(0));
+        assert_eq!(off[1].as_u64(), Some(5));
+    }
+
+    // Multibyte (Unicode) verbatim is truncated on a char boundary and does NOT panic.
+    #[test]
+    fn excerpt_cap_multibyte_no_panic() {
+        let j = journal();
+        let adv = advisor(&j);
+        // "café→world": 'é' is 2 bytes, '→' is 3 bytes.
+        // char sequence: c(1) a(1) f(1) é(2) →(3) w(1) o(1) r(1) l(1) d(1) = 10 chars, 14 bytes
+        let content = "caf\u{00e9}\u{2192}world".to_string();
+        assert_eq!(content.chars().count(), 10, "fixture sanity");
+        let fetcher = CountingFetcher {
+            content: content.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let model = CountingModel {
+            raws: vec![RawExtraction {
+                field: "text".to_string(),
+                verbatim: content.clone(), // full string
+            }],
+            calls: AtomicUsize::new(0),
+        };
+        let schema = vec!["text".to_string()];
+        // Cap at 5 chars: "café→" (1+1+1+2+3 = 8 bytes)
+        let cap = 5usize;
+        let resp = run_fetch_extract(
+            &j,
+            &adv,
+            &fetcher,
+            &model,
+            "claude-haiku-4-5",
+            "https://example.com/multibyte",
+            &schema,
+            cap,
+        );
+        let extraction = match resp {
+            Response::Extraction { extraction } => extraction,
+            other => panic!("expected Extraction, got {other:?}"),
+        };
+        let extractions = extraction.get("extractions").and_then(|e| e.as_array()).unwrap();
+        let verbatim = extractions[0].get("verbatim").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(
+            verbatim.chars().count(),
+            cap,
+            "multibyte verbatim must be capped to {cap} chars"
+        );
+        assert!(
+            content.starts_with(verbatim),
+            "truncated multibyte verbatim must be a prefix of the original"
+        );
+        // Offset span byte-length must match.
+        let off = extractions[0].get("char_offset").and_then(|o| o.as_array()).unwrap();
+        let start = off[0].as_u64().unwrap() as usize;
+        let end = off[1].as_u64().unwrap() as usize;
+        assert_eq!(
+            end - start,
+            verbatim.len(),
+            "char_offset span must match truncated verbatim byte-length for multibyte string"
+        );
+        // The truncated verbatim must be a valid substring (char boundary-safe).
+        assert_eq!(&content[start..end], verbatim, "offset must index the correct substring");
+    }
+
+    // cap_chars = 0 means unlimited (never truncate).
+    #[test]
+    fn excerpt_cap_zero_means_unlimited() {
+        let j = journal();
+        let adv = advisor(&j);
+        let long = "a".repeat(5000);
+        let content = long.clone();
+        let fetcher = CountingFetcher {
+            content: content.clone(),
+            calls: AtomicUsize::new(0),
+        };
+        let model = CountingModel {
+            raws: vec![RawExtraction {
+                field: "big".to_string(),
+                verbatim: long.clone(),
+            }],
+            calls: AtomicUsize::new(0),
+        };
+        let schema = vec!["big".to_string()];
+        let resp = run_fetch_extract(
+            &j,
+            &adv,
+            &fetcher,
+            &model,
+            "claude-haiku-4-5",
+            "https://example.com/unlimited",
+            &schema,
+            0, // 0 = no cap
+        );
+        let extraction = match resp {
+            Response::Extraction { extraction } => extraction,
+            other => panic!("expected Extraction, got {other:?}"),
+        };
+        let extractions = extraction.get("extractions").and_then(|e| e.as_array()).unwrap();
+        let verbatim = extractions[0].get("verbatim").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(verbatim.len(), 5000, "cap=0 must not truncate");
     }
 }

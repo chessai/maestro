@@ -480,6 +480,7 @@ fn fetch_extract_handler(
         &model_name,
         url,
         schema_fields,
+        rp.shim.excerpt_cap_chars as usize,
     )
 }
 
