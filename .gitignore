@@ -5,3 +5,6 @@ result-*
 *.db
 *.db-wal
 *.db-shm
+
+# local secrets (never commit)
+.envrc
