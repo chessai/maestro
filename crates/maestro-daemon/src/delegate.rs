@@ -1104,7 +1104,15 @@ fn run_pipeline(
 
                 if tier == top {
                     // One failure after reaching the top → blocked (resting).
-                    emit(state, task_id, EventKind::Blocked, None);
+                    // Preserve the failed attempt's work in the journal so a
+                    // superseded/abandoned task (whose worktree is later torn
+                    // down) is not silently lost — same `partial_diff` shape as
+                    // the kill/wedge snapshots.
+                    let blocked_payload = serde_json::json!({
+                        "partial_diff": last_failed_diff.as_deref().map(cap_diff),
+                    })
+                    .to_string();
+                    emit(state, task_id, EventKind::Blocked, Some(&blocked_payload));
                     return Ok(());
                 }
                 if tier_failures >= 2 {
@@ -1112,7 +1120,11 @@ fn run_pipeline(
                     let Some(next) = next_configured_tier(&rp, tier) else {
                         // No higher configured tier despite tier != top: treat
                         // as blocked (defensive; top_tier should preclude this).
-                        emit(state, task_id, EventKind::Blocked, None);
+                        let blocked_payload = serde_json::json!({
+                            "partial_diff": last_failed_diff.as_deref().map(cap_diff),
+                        })
+                        .to_string();
+                        emit(state, task_id, EventKind::Blocked, Some(&blocked_payload));
                         return Ok(());
                     };
                     let next_role = role_for_tier(&rp, next).ok_or_else(|| {
@@ -1360,7 +1372,14 @@ fn driven_prompt(spec: &TaskSpec) -> String {
     // occurrence. We spell the marker as PLAN<colon> in prose to avoid that.
     format!(
         "# Task\n## Title\n{title}\n\n## Instructions\n{instructions}\n\n\
-         ## File allowlist (only edit these)\n{allowlist}\n\n\
+         ## File allowlist — HARD BOUNDARY\n\
+         You may ONLY create or modify files matching these paths/globs:\n{allowlist}\n\n\
+         Any file OUTSIDE this list that you create or modify WILL BE DROPPED (it is \
+         excluded from the commit), which typically breaks the build — so do NOT \
+         split, extract, move, or restructure code into new files outside the \
+         allowlist. If completing the task genuinely requires touching files outside \
+         this list (e.g. a refactor), STOP and report that you need a wider allowlist \
+         instead of working around it.\n\n\
          First output a single line beginning with the word PLAN followed by a \
          colon, summarizing your plan, then implement.\n",
         title = spec.title,
@@ -2465,5 +2484,19 @@ roles.tier1 = { model = "qwen", kind = "openai_compat", base_url = "http://local
             effective_turn_cap(&rp, &recipe_with_downgraded(true), &anthropic, &spec_with_turns(Some(1))),
             1
         );
+    }
+
+    #[test]
+    fn driven_prompt_states_allowlist_is_a_hard_boundary() {
+        let prompt = driven_prompt(&spec_with_allowlist(2));
+        // The allowlist paths are listed.
+        assert!(prompt.contains("src/f0.rs") && prompt.contains("src/f1.rs"));
+        // The boundary + its consequence + the escape hatch are spelled out, so a
+        // worker won't blindly split/restructure into out-of-allowlist files.
+        assert!(prompt.contains("HARD BOUNDARY"));
+        assert!(prompt.contains("WILL BE DROPPED"));
+        assert!(prompt.contains("STOP and report"));
+        // The plan-echo mechanic is preserved (do not break the plan extractor).
+        assert!(prompt.contains("PLAN"));
     }
 }

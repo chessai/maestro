@@ -70,6 +70,19 @@ review, but you do **not** edit files directly. The working tree is mounted
   is never auto-merged.
 - A writable scratch dir is provided for plans and notes; in-repo writes are
   limited to the opt-in `advisor.writable_paths` allowlist (default: none).
+
+### Writing task specs
+
+- **One task per delegation.** Give each independent unit of work its OWN
+  `delegate` call — never bundle separable deliverables into one spec. A bundled
+  task fails as a unit: one deliverable's compile error or gate failure sinks the
+  rest. Sequence dependent tasks; fan out independent ones in parallel.
+- **Size the `file_allowlist` to the task's blast radius.** Use a tight
+  exact-file allowlist (plus an \"edit in place\" instruction) for surgical fixes;
+  use a directory/glob allowlist (e.g. `crates/foo/src/**`) for work that may
+  legitimately create or move files (refactors, new modules). Too narrow an
+  allowlist silently forbids refactors and produces confusing failures — scope
+  deliberately, not reflexively minimal.
 <!-- /maestro:advisor-role -->
 ";
 
@@ -480,5 +493,13 @@ mod tests {
             Some(v) => std::env::set_var("MAESTRO_MCP_BIN", v),
             None => std::env::remove_var("MAESTRO_MCP_BIN"),
         }
+    }
+
+    #[test]
+    fn advisor_role_has_spec_authoring_guidance() {
+        // The shipped advisor role text must carry both spec-authoring rules.
+        assert!(CLAUDE_MD_SECTION.contains("One task per delegation"));
+        assert!(CLAUDE_MD_SECTION.contains("blast radius"));
+        assert!(CLAUDE_MD_SECTION.contains("edit in place"));
     }
 }
