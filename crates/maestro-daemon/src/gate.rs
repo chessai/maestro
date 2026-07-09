@@ -59,6 +59,29 @@ const OUTPUT_DIGEST_CAP: usize = 4000;
 /// `TightenedScopeExceeded` payload (bounds the journal write).
 const TIGHTENED_FILES_CAP: usize = 50;
 
+/// Env keys the gate removes from a check command's process for hermeticity
+/// (ADR-004): the fixed set of daemon-owned `XDG_*` dirs (config/state/data/
+/// runtime) plus every inherited `MAESTRO_*` var. `XDG_CACHE_HOME` is kept on
+/// purpose — it aids build caching and carries no daemon config. Verify surfaces
+/// that execute the same recipe should scrub identically.
+fn hermetic_scrub_keys() -> Vec<String> {
+    let mut keys: Vec<String> = [
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for (k, _) in std::env::vars() {
+        if k.starts_with("MAESTRO_") {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
 /// Run the mechanical gate against a worktree, running each check command under
 /// the task's containment `spec` (ADR-004). A `wrap` failure (e.g. the podman
 /// backend needs an image) is surfaced as an `Err` — the caller turns it into an
@@ -129,9 +152,20 @@ pub fn run(
         let bash_args = vec!["-lc".to_string(), cmd.clone()];
         let wrapped = maestro_sandbox::wrap(spec, "bash", &bash_args)
             .with_context(|| format!("wrapping check command {cmd:?} for containment"))?;
-        let output = Command::new(&wrapped.program)
-            .args(&wrapped.args)
-            .current_dir(worktree_path)
+        let mut command = Command::new(&wrapped.program);
+        command.args(&wrapped.args).current_dir(worktree_path);
+        // Gate hermeticity (ADR-004): scrub env vars that leak the DAEMON's own
+        // configuration into the check process. The daemon runs with its own
+        // `XDG_*` (config/state/runtime) and `MAESTRO_*` vars; a check command
+        // inherits them, and when the repo under test reads XDG (e.g. maestro's
+        // own tests, or any tool that honors it) its checks read the daemon's
+        // config and fail non-deterministically. Removing these makes the check
+        // env hermetic w.r.t. the daemon; `XDG_CACHE_HOME` is deliberately kept
+        // (build-cache friendly, carries no config).
+        for key in hermetic_scrub_keys() {
+            command.env_remove(key);
+        }
+        let output = command
             .output()
             .with_context(|| format!("spawning check command {cmd:?}"))?;
         if !output.status.success() {
@@ -245,6 +279,38 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(out, GateOutcome::ChecksFailed { .. }));
+    }
+
+    // Gate hermeticity (ADR-004): the daemon's own XDG_*/MAESTRO_* env must NOT
+    // leak into a check command — else e.g. maestro's own tests read the daemon's
+    // config and fail. Set both in the parent; the check command passes only if
+    // both are unset in the child. XDG_CACHE_HOME is intentionally preserved.
+    #[test]
+    fn check_command_env_is_scrubbed_of_daemon_config() {
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/daemon-xdg-config");
+        std::env::set_var("MAESTRO_PROFILE", "leaky");
+        std::env::set_var("XDG_CACHE_HOME", "/tmp/keep-cache");
+        let (_repo, wt) = init_worktree_repo();
+        std::fs::write(wt.path().join("a.rs"), "//\n").unwrap();
+        let out = run(
+            wt.path(),
+            "HEAD",
+            &["*.rs".into()],
+            None,
+            // Passes (exit 0) iff XDG_CONFIG_HOME + MAESTRO_PROFILE are unset AND
+            // XDG_CACHE_HOME survived.
+            &["[ -z \"$XDG_CONFIG_HOME\" ] && [ -z \"$MAESTRO_PROFILE\" ] && [ -n \"$XDG_CACHE_HOME\" ]"
+                .into()],
+            &l0_spec(wt.path()),
+        )
+        .unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("MAESTRO_PROFILE");
+        std::env::remove_var("XDG_CACHE_HOME");
+        assert!(
+            matches!(out, GateOutcome::Passed { .. }),
+            "daemon XDG_*/MAESTRO_* must be scrubbed (XDG_CACHE_HOME kept), got {out:?}"
+        );
     }
 
     /// Write `n` distinct in-allowlist `*.rs` files into the worktree.
