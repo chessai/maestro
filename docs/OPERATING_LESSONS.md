@@ -160,6 +160,27 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   `XDG_CACHE_HOME`) via `.env_remove()` on the check command. Keep gate commands
   hermetic by construction.
 
+### L16. Acceptance must be INDEPENDENT of the worker's self-written tests — rule (advisor behavior)
+- **Observed:** a driven worker "implemented" theseus-syntax and its own
+  `tests/conformance.rs` passed — but the implementation was **missing ~half the
+  frozen grammar** (only the `= expr` iso body; no clause bodies, patterns,
+  `where`, `prim`, `$label`, tuple types, or literals). Its self-written tests
+  were weak enough to pass the incomplete parser, so a build-only gate — or a gate
+  running the *worker's own* tests — would have green-lit it. Only re-checking
+  against the full conformance suite with strong assertions (parse **every**
+  fixture except the one negative case, round-trip **every** program, precedence)
+  exposed it. A subagent with cargo access then completed it to 24 real tests.
+- **Impact:** a worker can define its own (weak) success criteria and ship
+  incomplete work that passes the gate — a false "verified".
+- **Incorporation:** advisor spec-authoring rule — **acceptance must not depend on
+  tests the worker authors for itself.** Either (a) have `check_commands` run an
+  **advisor-controlled / shared acceptance suite** (e.g. the versioned conformance
+  fixtures with exhaustive assertions the worker cannot weaken), or (b) ship the
+  test harness in the spec / repo, not "write your own tests." State the DoD as
+  concrete, independently-checkable coverage ("**every** `conformance/**` fixture
+  parses except 0007"), never "add tests." Complements L6 (gate must RUN tests):
+  L6 says run tests; L16 says they must be tests the worker can't game.
+
 ### L15. Fix-in-place retry on `checks_failed` — preserve near-complete work — FIXED
 - **Observed:** when an attempt failed at the mechanical GATE (`checks_failed` —
   a build/clippy/test `check_command` returned non-zero), the retry cut a FRESH
