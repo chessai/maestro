@@ -411,6 +411,25 @@ fn run_json_phase(
             pty.teardown();
             break JsonPhaseKind::Killed(kk);
         }
+        // (a0) terminal `result` event — claude's authoritative phase-complete
+        // signal. Prefer it over waiting for a process exit: some `claude --print`
+        // sessions emit `result` and then never exit (observed after subagent-heavy
+        // plan phases), which would otherwise leave this loop spinning until the
+        // idle watchdog reaped a phase that had, in fact, finished. Give the child a
+        // brief grace to exit and flush its final lines on its own; if it lingers,
+        // tear it down and treat the phase as complete with the result's own status.
+        if state.result_seen {
+            std::thread::sleep(POLL);
+            parse_new_lines(&pty, &mut cursor, &mut state);
+            let code = match pty.child.try_wait() {
+                Ok(Some(status)) => exit_code(&status),
+                _ => {
+                    pty.teardown();
+                    Some(if state.result_is_error { 1 } else { 0 })
+                }
+            };
+            break JsonPhaseKind::Exited(code);
+        }
         // (a) child exit — drain any final lines the reader may still deliver.
         match pty.child.try_wait() {
             Ok(Some(status)) => {
@@ -453,6 +472,16 @@ struct ParseState {
     /// The plan submitted via an `ExitPlanMode` tool call, if any (last one
     /// wins). When non-empty this takes precedence over `all_text`.
     exit_plan: String,
+    /// The terminal `result` stream-json event has been observed. This is
+    /// claude's authoritative "phase complete" signal; the phase loop ends on it
+    /// rather than waiting for a process exit that some `claude --print` sessions
+    /// never deliver (observed after heavy subagent use — the process emits its
+    /// `result` and then lingers, which would otherwise spin until the idle
+    /// watchdog fired 30 min later).
+    result_seen: bool,
+    /// Whether that `result` event reported an error (`is_error` / `subtype ==
+    /// "error"`), so a completed-but-errored phase still maps to a non-zero exit.
+    result_is_error: bool,
 }
 
 impl ParseState {
@@ -516,6 +545,12 @@ fn fold_event(value: &serde_json::Value, state: &mut ParseState) {
             }
         }
         Some("result") => {
+            state.result_seen = true;
+            state.result_is_error = value
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || value.get("subtype").and_then(|v| v.as_str()) == Some("error");
             if let Some(n) = value.get("num_turns").and_then(|v| v.as_u64()) {
                 state.metering.result_turns = Some(n as u32);
             }

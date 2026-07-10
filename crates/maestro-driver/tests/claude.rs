@@ -150,6 +150,18 @@ case "${mode}" in
         emit_result 11 7 0.01 2
         exit 0
         ;;
+      resultlinger)
+        # REGRESSION: emit the full execute phase (write target + result) and then
+        # LINGER without exiting — the observed `claude --print` failure mode where
+        # the process emits its terminal `result` and never exits. The phase MUST
+        # end on the `result` event, not spin until the idle watchdog.
+        emit_init
+        emit_assistant "doing the work"
+        printf 'written by fake claude\n' > "${TARGET}"
+        emit_result 11 7 0.01 2
+        sleep 3000
+        exit 0
+        ;;
       *)
         emit_init
         emit_assistant "doing the work"
@@ -320,6 +332,36 @@ fn agentic_plan_phase_accumulates_text_and_accepts() {
         f.target.is_file(),
         "phase 2 should have run and written the target"
     );
+}
+
+/// REGRESSION (result-event completion): a `claude --print` execute phase that
+/// emits its terminal `result` and then LINGERS without exiting (the observed
+/// failure mode after subagent-heavy sessions). The phase must complete ON the
+/// `result` event — writing the target and returning Completed — rather than
+/// waiting for a process exit that never comes and wedging at the idle watchdog.
+#[test]
+fn phase_completes_on_result_event_even_if_process_never_exits() {
+    let f = fixture();
+    // Watchdog comfortably longer than the fix's ~POLL grace. With the bug (wait
+    // for process exit), this would hang until the 20s watchdog Wedged it; the fix
+    // ends the phase on the `result` event, so it returns promptly as Completed.
+    let cfg = config(&f, "resultlinger", Duration::from_secs(20), None);
+    let (_handle, join) = run_claude_driven(cfg, spec(), Arc::new(MockPlanChecker)).unwrap();
+    let result = join.join().unwrap();
+
+    assert_eq!(
+        result.reason,
+        EndReason::Completed,
+        "the phase must end on the terminal `result` event, not wait for a process \
+         exit that never comes; log at {:?}",
+        f.log
+    );
+    assert!(
+        f.target.is_file(),
+        "the execute phase should have written the target before lingering"
+    );
+    // Metering from the result is still captured despite the linger+teardown.
+    assert_eq!(result.turns, 3, "plan(1) + execute(2) turns from result.num_turns");
 }
 
 /// The plan phase submits its plan via an `ExitPlanMode` tool_use (with NO plain

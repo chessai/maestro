@@ -111,6 +111,26 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
      (`bash -c '…'`). Prefer lever 1 + gate-authoritative, or a tightly-scoped
      lever 2 — never a blanket allow.
 
+### L13. End a driven phase on the `result` event, not on process exit — FIXED
+- **Observed:** the driven adapter's phase loop only ended a phase when the child
+  process **exited** (`try_wait`). But `claude --print` sometimes emits its
+  terminal `result` stream-json event and then **never exits** (reproducibly
+  after subagent-heavy plan phases — the plan is done, `plan_results=1`, but the
+  process lingers idle). The loop then spun until the **idle watchdog** reaped it
+  30 min later as `Wedged` → task `failed`. This was the root cause of theseus-
+  syntax attempts 3 and 4 stranding at the plan→execute handoff (L4's plan-phase
+  ceiling only made it fail *faster*, not succeed).
+- **Impact:** a semantically-complete phase fails because the process doesn't
+  exit; the whole task dies at the handoff, flakily.
+- **Incorporation:** LANDED. `run_json_phase` now ends the phase as soon as the
+  authoritative `result` event is parsed (`ParseState.result_seen`): it grace-
+  drains final lines, then — if the process is still alive — tears it down and
+  returns `Exited` with the result's own status (`result_is_error` → non-zero).
+  The `result` event, not process exit, is claude's real "phase complete" signal.
+  Regression test `claude::phase_completes_on_result_event_even_if_process_never_exits`
+  (a mock that emits `result` then `sleep 3000` — completes on the event instead
+  of wedging at the watchdog).
+
 ---
 
 ## Gate / verification
