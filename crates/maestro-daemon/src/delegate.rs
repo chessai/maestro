@@ -680,6 +680,48 @@ fn validate_spec(spec: &TaskSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a spec's `check_commands` look BUILD-ONLY — they run at least one
+/// command but none of them execute a test suite (operating-lesson L6). A
+/// build-only gate compiles the deliverable but never runs its tests, so a task
+/// can be "verified" while shipping test-file defects. This is a pure, heuristic
+/// detector used only to WARN (never to reject): the advisor stays in control.
+///
+/// Returns `false` when there are no check commands at all (nothing to warn
+/// about — an empty gate is a separate, pre-existing concern) or when ANY command
+/// contains a recognizable test-runner token. The match is case-insensitive and
+/// substring-based; it errs toward NOT warning (no false alarms) — e.g. a wrapper
+/// script or a Makefile target like `make check` that internally runs tests is
+/// assumed to test. Recognized tokens cover the common runners across ecosystems.
+fn check_commands_look_build_only(check_commands: &[String]) -> bool {
+    if check_commands.is_empty() {
+        return false;
+    }
+    // Test-runner signals. Substring, lowercased. Kept deliberately broad so a
+    // command that plausibly runs tests suppresses the warning (avoid false
+    // positives that would train operators to ignore it).
+    const TEST_TOKENS: &[&str] = &[
+        "test",     // cargo test, go test, npm test, dotnet test, ctest, `make test`
+        "nextest",  // cargo nextest
+        "pytest",   // python
+        "unittest", // python -m unittest
+        "jest",     // js
+        "vitest",   // js
+        "mocha",    // js
+        "rspec",    // ruby
+        "phpunit",  // php
+        "check",    // `make check`, `cargo check` is build-ish but `make check` tests;
+                    // erring toward not-warning is the intended bias
+        "spec",     // *_spec targets
+        "junit",    // java
+        "gradle",   // gradle test tasks (broad; suppresses to avoid false alarm)
+    ];
+    // Build-only iff NO command contains any test token.
+    !check_commands.iter().any(|cmd| {
+        let lc = cmd.to_lowercase();
+        TEST_TOKENS.iter().any(|tok| lc.contains(tok))
+    })
+}
+
 /// Append a task event under the shared journal lock. Errors are logged, not
 /// propagated, so the worker's own control flow stays linear.
 fn emit(state: &DelegationState, task_id: &str, kind: EventKind, payload: Option<&str>) {
@@ -767,6 +809,19 @@ pub fn delegate(
     // itself (branching off it is valid; it is simply not merge_task-able).
     let base_ref = worktree::resolve_base_ref(&repo, &spec.base_ref);
 
+    // Pin `base_ref` to the concrete commit SHA it points at NOW (operating-lesson
+    // L3). Every attempt's worktree is cut from this exact commit, and the
+    // scope/allowlist diff is taken against it — NOT the live `base_ref` tip. If a
+    // sibling task merges into `base_ref` while this task runs, the base branch
+    // advances but this task's scope check still diffs against the commit it was
+    // cut from, so the newly-merged files never appear as out-of-allowlist
+    // deletions → no spurious `scope_violation`. The MERGE TARGET stays the live
+    // symbolic `base_ref` (so `merge_task` can still fast-forward it); only the
+    // scope diff uses the pinned SHA. A ref that cannot be peeled to a commit
+    // (bogus / empty repo) leaves the pin absent → the pipeline falls back to the
+    // symbolic `base_ref`, preserving the prior behavior.
+    let pinned_base = worktree::resolve_to_sha(&repo, &base_ref);
+
     // The workspace path is fixed by convention: <state>/worktrees/<task_id>.
     // We do not know the task_id until create_task mints it, so record the row
     // first, then note the intended workspace via the worker.
@@ -787,13 +842,38 @@ pub fn delegate(
             .map_err(|e| DelegateError::Internal(format!("create_task: {e}")))?
     };
 
-    emit(state, &task_id, EventKind::Created, None);
+    // Warn (never reject) when the spec's check_commands look build-only — they
+    // compile the deliverable but run no tests, so a "verified" verdict can hide
+    // test-file defects (operating-lesson L6). Surface it BOTH to the operator
+    // (tracing) and to the advisor (inlined in the `created` event payload so it
+    // rides the inbox without a new event kind). The advisor stays in control.
+    let created_payload = if check_commands_look_build_only(&spec.check_commands) {
+        tracing::warn!(
+            task = %task_id,
+            check_commands = ?spec.check_commands,
+            "spec check_commands look build-only (no test runner detected); a build-only \
+             gate can report 'verified' while shipping test defects (L6)"
+        );
+        Some(
+            serde_json::json!({
+                "warning": "check_commands_build_only",
+                "message": "check_commands compile but run no tests; the gate can report \
+                            'verified' while test-file defects slip through. Add a \
+                            test-running command (e.g. `cargo test`/`cargo nextest run`) \
+                            to the acceptance gate.",
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
+    emit(state, &task_id, EventKind::Created, created_payload.as_deref());
 
     // 3. Spawn the background worker.
     let state = Arc::clone(state);
     let tid = task_id.clone();
     std::thread::spawn(move || {
-        run_worker(state, tid, repo, base_ref, spec, role, recipe);
+        run_worker(state, tid, repo, base_ref, pinned_base, spec, role, recipe);
     });
 
     Ok(task_id)
@@ -807,6 +887,7 @@ fn run_worker(
     task_id: String,
     repo: PathBuf,
     base_ref: String,
+    pinned_base: Option<String>,
     spec: TaskSpec,
     role: ResolvedRole,
     recipe: ContainmentRecipe,
@@ -871,7 +952,16 @@ fn run_worker(
     }
     let _slot = SlotGuard(&state);
 
-    if let Err(fail) = run_pipeline(&state, &task_id, &repo, &base_ref, &spec, &role, &recipe) {
+    if let Err(fail) = run_pipeline(
+        &state,
+        &task_id,
+        &repo,
+        &base_ref,
+        pinned_base.as_deref(),
+        &spec,
+        &role,
+        &recipe,
+    ) {
         // Any pipeline error is journaled as a terminal `failed`.
         let payload = failure_payload(fail.kind(), fail.message(), None);
         emit(&state, &task_id, EventKind::Failed, Some(&payload));
@@ -1008,10 +1098,18 @@ fn run_pipeline(
     task_id: &str,
     repo: &Path,
     base_ref: &str,
+    pinned_base: Option<&str>,
     spec: &TaskSpec,
     initial_role: &ResolvedRole,
     recipe: &ContainmentRecipe,
 ) -> Result<(), WorkerFailure> {
+    // The commit-ish every attempt cuts its worktree from AND diffs against for
+    // the scope/allowlist check (operating-lesson L3). Prefer the pinned SHA (the
+    // concrete commit `base_ref` pointed at when the task spawned); fall back to
+    // the symbolic `base_ref` when pinning was not possible. Distinct from the
+    // MERGE target (`base_ref`), which stays the live ref so `merge_task` can
+    // fast-forward it.
+    let scope_base = pinned_base.unwrap_or(base_ref);
     // Resolve the profile once for verifier selection + the escalation ladder.
     let rp = resolved_profile(state.profile_flag.as_deref())
         .map_err(|e| fail("internal_error", format!("resolving profile: {e}")))?;
@@ -1073,7 +1171,7 @@ fn run_pipeline(
             state,
             task_id,
             repo,
-            base_ref,
+            scope_base,
             spec,
             &role,
             attempt,
@@ -1161,7 +1259,10 @@ fn run_attempt(
     state: &DelegationState,
     task_id: &str,
     repo: &Path,
-    base_ref: &str,
+    // The pinned base commit-ish (operating-lesson L3): every worktree is cut
+    // from this exact commit and the scope/verifier diff is taken against it, so
+    // the base branch advancing mid-task cannot cause a spurious scope violation.
+    scope_base: &str,
     spec: &TaskSpec,
     role: &ResolvedRole,
     attempt: i64,
@@ -1179,7 +1280,7 @@ fn run_attempt(
             state,
             task_id,
             repo,
-            base_ref,
+            scope_base,
             spec,
             role,
             attempt,
@@ -1211,8 +1312,8 @@ fn run_attempt(
             fail("model_unavailable", e.message_public().to_string())
         })?;
 
-    // --- create a FRESH worktree per attempt off base_ref ---------------
-    let worktree_path = worktree::create(repo, base_ref, task_id)
+    // --- create a FRESH worktree per attempt off the PINNED base (L3) ----
+    let worktree_path = worktree::create(repo, scope_base, task_id)
         .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
 
     let workspace = worktree_path.to_string_lossy().to_string();
@@ -1332,7 +1433,7 @@ fn run_attempt(
     run_gate_and_verify(
         state,
         task_id,
-        base_ref,
+        scope_base,
         spec,
         role,
         attempt,
@@ -1353,6 +1454,25 @@ fn watchdog_duration(rp: &ResolvedProfile) -> Duration {
         }
     }
     Duration::from_secs(u64::from(rp.watchdog_minutes.max(1)) * 60)
+}
+
+/// The PLAN-PHASE wall-clock ceiling for the structured `claude` adapter
+/// (operating-lesson L4). The plan phase is turn-uncapped and only covered by the
+/// IDLE watchdog, so an active-but-looping plan (one that keeps emitting output)
+/// could run unbounded. This bounds it by absolute wall-clock, independent of
+/// activity. Overridable by `MAESTRO_PLAN_CEILING_SECONDS` (tests set a short
+/// value); otherwise a generous multiple of the watchdog — a plan may span a few
+/// active turns but should never approach the task-lifetime ceiling — with a
+/// 5-minute floor.
+fn plan_ceiling_duration(rp: &ResolvedProfile) -> Duration {
+    if let Ok(secs) = std::env::var("MAESTRO_PLAN_CEILING_SECONDS") {
+        if let Ok(secs) = secs.trim().parse::<u64>() {
+            return Duration::from_secs(secs.max(1));
+        }
+    }
+    let watchdog = watchdog_duration(rp);
+    // 5× the watchdog, floored at 5 minutes.
+    (watchdog * 5).max(Duration::from_secs(5 * 60))
 }
 
 /// Build the task prompt handed to a driven CLI over the PTY (ADR-003 plan-echo):
@@ -1428,7 +1548,9 @@ fn run_driven_attempt(
     state: &DelegationState,
     task_id: &str,
     repo: &Path,
-    base_ref: &str,
+    // The pinned base commit-ish (operating-lesson L3): the worktree is cut from
+    // it and every diff (gate, verifier, forensic snapshot) is taken against it.
+    scope_base: &str,
     spec: &TaskSpec,
     role: &ResolvedRole,
     attempt: i64,
@@ -1451,8 +1573,8 @@ fn run_driven_attempt(
         })?;
     let args = role.args.clone().unwrap_or_default();
 
-    // --- fresh worktree per attempt off base_ref (the CLI edits it) -----
-    let worktree_path = worktree::create(repo, base_ref, task_id)
+    // --- fresh worktree per attempt off the PINNED base (L3; CLI edits it) --
+    let worktree_path = worktree::create(repo, scope_base, task_id)
         .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
     let workspace = worktree_path.to_string_lossy().to_string();
 
@@ -1505,6 +1627,9 @@ fn run_driven_attempt(
     let turn_cap = effective_turn_cap(rp, recipe, role, spec);
 
     let watchdog = watchdog_duration(rp);
+    // L4: bound the (turn-uncapped) plan phase by wall-clock. Only the structured
+    // `claude` adapter reads it; the generic path ignores it.
+    let plan_ceiling = plan_ceiling_duration(rp);
 
     // API-billed: when max_budget_usd is set, keep provider API keys so the
     // CLI can authenticate per-token and self-enforce the cap. Subscription
@@ -1530,6 +1655,8 @@ fn run_driven_attempt(
         plan_timeout: watchdog,
         turn_cap: Some(turn_cap),
         max_budget_usd: role.max_budget_usd,
+        // L4: plan-phase wall-clock ceiling (structured `claude` adapter only).
+        plan_ceiling: Some(plan_ceiling),
         // Strip provider API keys for subscription-authenticated CLIs (flat-
         // rate, unmetered). When max_budget_usd is set the role is API-billed
         // (pay-per-token): retain the keys so the CLI can authenticate and
@@ -1583,8 +1710,9 @@ fn run_driven_attempt(
         tracing::info!(task = %task_id, attempt, cost_usd = cost, "driven session reported cost");
     }
 
-    // A capped partial-diff snapshot for kill/wedge forensics (ADR-006).
-    let snapshot = || cap_diff(&worktree::snapshot_diff(&worktree_path, base_ref));
+    // A capped partial-diff snapshot for kill/wedge forensics (ADR-006). Taken
+    // against the pinned base (L3) — the commit the worktree was cut from.
+    let snapshot = || cap_diff(&worktree::snapshot_diff(&worktree_path, scope_base));
 
     match result.reason {
         EndReason::Completed => {
@@ -1602,7 +1730,7 @@ fn run_driven_attempt(
             run_gate_and_verify(
                 state,
                 task_id,
-                base_ref,
+                scope_base,
                 spec,
                 role,
                 attempt,
@@ -1752,7 +1880,12 @@ fn cap_diff(diff: &str) -> String {
 fn run_gate_and_verify(
     state: &DelegationState,
     task_id: &str,
-    base_ref: &str,
+    // The pinned base commit-ish (operating-lesson L3): the scope/allowlist diff,
+    // the checks-failed diff, and the verifier's structural diff are ALL taken
+    // against this exact commit — the one the worktree was cut from — never the
+    // live `base_ref` tip. This makes the scope check immune to the base branch
+    // advancing while the task runs.
+    scope_base: &str,
     spec: &TaskSpec,
     role: &ResolvedRole,
     attempt: i64,
@@ -1775,7 +1908,7 @@ fn run_gate_and_verify(
     emit(state, task_id, EventKind::ChecksStarted, None);
     let gate_outcome = gate::run(
         worktree_path,
-        base_ref,
+        scope_base,
         &spec.file_allowlist,
         max_changed_files,
         &spec.check_commands,
@@ -1827,7 +1960,7 @@ fn run_gate_and_verify(
             emit(state, task_id, EventKind::ChecksFailed, Some(&payload));
             // Counts as a verification failure (ADR-003). No verifier ran, so no
             // report; carry the diff for the next attempt's context.
-            let diff = worktree::diff(worktree_path, base_ref).unwrap_or_default();
+            let diff = worktree::diff(worktree_path, scope_base).unwrap_or_default();
             Ok(AttemptOutcome::VerificationFailed { diff, report: None })
         }
         GateOutcome::Passed { changed } => {
@@ -1840,7 +1973,7 @@ fn run_gate_and_verify(
             // (e.g. `target/`) that a check command created out of the diff even
             // when the repo has no `.gitignore` — a plain `add -A` diff would
             // otherwise stage them.
-            let diff = worktree::diff_paths(worktree_path, base_ref, &changed)
+            let diff = worktree::diff_paths(worktree_path, scope_base, &changed)
                 .map_err(|e| fail("internal_error", format!("diff for verifier: {e}")))?;
 
             let report = run_verifier(
@@ -2060,6 +2193,29 @@ mod tests {
             check: check.into(),
             kind,
         }
+    }
+
+    // L6: build-only check_commands are flagged; anything that runs tests is not.
+    #[test]
+    fn build_only_check_commands_are_flagged() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // No commands → nothing to warn about (empty gate is a separate concern).
+        assert!(!check_commands_look_build_only(&[]));
+
+        // Pure build/lint gates → build-only.
+        assert!(check_commands_look_build_only(&s(&["cargo build"])));
+        assert!(check_commands_look_build_only(&s(&["cargo build --release", "cargo clippy"])));
+        assert!(check_commands_look_build_only(&s(&["nix build .#pkg"])));
+
+        // Any test-running command suppresses the warning (case-insensitive).
+        assert!(!check_commands_look_build_only(&s(&["cargo test"])));
+        assert!(!check_commands_look_build_only(&s(&["cargo build", "cargo test --all"])));
+        assert!(!check_commands_look_build_only(&s(&["cargo nextest run"])));
+        assert!(!check_commands_look_build_only(&s(&["CARGO_TEST=1 make TEST"])));
+        assert!(!check_commands_look_build_only(&s(&["pytest -q"])));
+        assert!(!check_commands_look_build_only(&s(&["npm test"])));
+        assert!(!check_commands_look_build_only(&s(&["make check"]))); // biased to not-warn
     }
 
     #[test]

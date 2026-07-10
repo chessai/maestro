@@ -122,6 +122,8 @@ fn config(f: &Fixture, scenario: &str, watchdog: Duration) -> DrivenConfig {
         env_remove: vec![],
         turn_cap: None,
         max_budget_usd: None,
+        // Generic driven path ignores the plan-phase ceiling (structured-only).
+        plan_ceiling: None,
     }
 }
 
@@ -303,6 +305,7 @@ exit 0
         env_remove: vec![TEST_VAR.to_string()],
         turn_cap: None,
         max_budget_usd: None,
+        plan_ceiling: None,
     };
 
     let (_handle, join) =

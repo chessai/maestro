@@ -18,6 +18,11 @@ pub enum Error {
     /// A referenced row was not found.
     #[error("not found: {0}")]
     NotFound(String),
+    /// The on-disk journal's schema version is incompatible with this binary:
+    /// either a pre-versioning legacy DB, or one written by a NEWER binary. The
+    /// message guides the operator to reset the journal.
+    #[error("journal schema incompatible: {0}")]
+    SchemaVersion(String),
 }
 
 /// The crate result alias.

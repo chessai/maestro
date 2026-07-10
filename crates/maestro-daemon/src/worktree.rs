@@ -93,6 +93,24 @@ pub fn resolve_base_ref(repo: &Path, base_ref: &str) -> String {
     base_ref.to_string()
 }
 
+/// Resolve `base_ref` to the concrete commit SHA it points at RIGHT NOW
+/// (`git rev-parse <base_ref>^{commit}`). Best-effort: any git error → `None`.
+///
+/// The delegation pipeline pins this SHA at spawn — the exact commit the task's
+/// worktree is cut from — and uses it (NOT the live symbolic `base_ref`) for the
+/// scope/allowlist diff. This makes the scope check immune to the base branch
+/// advancing while the task runs (ADR-006 / operating-lesson L3): if a sibling
+/// task merges into `base_ref` mid-flight, the newly-merged files no longer
+/// appear as out-of-allowlist deletions in this task's diff. The *merge target*
+/// stays the live `base_ref`; only the scope diff uses the pinned SHA.
+pub fn resolve_to_sha(repo_path: &Path, base_ref: &str) -> Option<String> {
+    let repo = repo_path.to_str()?;
+    // `<ref>^{commit}` forces peeling to a commit (a tag/annotated-tag resolves
+    // to the commit it points at), so the pinned value is always a commit SHA.
+    let spec = format!("{base_ref}^{{commit}}");
+    git_c(repo, &["rev-parse", "--verify", "--quiet", &spec]).ok()
+}
+
 /// Create a worktree for `task_id` off `base_ref`, on a fresh branch
 /// `maestro/<task_id>`. Returns the worktree path.
 pub fn create(repo_path: &Path, base_ref: &str, task_id: &str) -> Result<PathBuf> {
@@ -545,6 +563,74 @@ mod tests {
         assert_eq!(resolve_base_ref(rp, &sha), sha, "SHA unchanged");
         // A bogus ref is returned unchanged (never panics).
         assert_eq!(resolve_base_ref(rp, "no-such-ref"), "no-such-ref", "bogus unchanged");
+    }
+
+    #[test]
+    fn resolve_to_sha_peels_refs_and_returns_none_for_bogus() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let head = head_of(rp, "main");
+        // A branch name resolves to its concrete commit SHA.
+        assert_eq!(resolve_to_sha(rp, "main").as_deref(), Some(head.as_str()));
+        // "HEAD" resolves to the same commit.
+        assert_eq!(resolve_to_sha(rp, "HEAD").as_deref(), Some(head.as_str()));
+        // A raw SHA resolves to itself.
+        assert_eq!(resolve_to_sha(rp, &head).as_deref(), Some(head.as_str()));
+        // A bogus ref → None (never panics).
+        assert_eq!(resolve_to_sha(rp, "no-such-ref"), None);
+    }
+
+    /// L3 regression: a task's scope diff must be taken against the commit its
+    /// worktree was cut from (the pinned base), NOT the live base ref. If the base
+    /// branch advances while the task runs — e.g. a sibling task merges into it —
+    /// the just-merged files appear as DELETIONS in a diff vs the advanced tip,
+    /// which (being outside the task's allowlist) would be a spurious
+    /// `scope_violation`. Pinning the base to the cut-from SHA prevents this.
+    #[test]
+    fn pinned_base_scope_diff_survives_base_advance() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let rps = rp.to_str().unwrap();
+
+        // Pin the base to the concrete commit the worktree will be cut from.
+        let pinned = resolve_to_sha(rp, "main").expect("main resolves to a SHA");
+
+        // Cut the task worktree off `main` (== the pinned commit right now).
+        let wt = TempDir::new().unwrap();
+        let wtp = wt.path().to_str().unwrap();
+        git(&["-C", rps, "worktree", "add", wtp, "-b", "maestro/l3", "main"]).unwrap();
+        // The task writes its ONE allowlisted file.
+        std::fs::write(wt.path().join("task.rs"), "// task\n").unwrap();
+
+        // A SIBLING task merges into `main` mid-flight: advance the base branch on
+        // a DIFFERENT file, outside this task's worktree.
+        std::fs::write(rp.join("sibling.rs"), "// sibling\n").unwrap();
+        git(&["-C", rps, "add", "-A"]).unwrap();
+        git(&["-C", rps, "commit", "-q", "-m", "sibling merged into main"]).unwrap();
+
+        // Diffing against the LIVE base ref now spuriously reports `sibling.rs` as
+        // a deletion (it exists on the advanced tip but not in the worktree cut
+        // from the older commit) — this is the bug.
+        let live = changed_files(wt.path(), "main").unwrap();
+        assert!(
+            live.contains(&"sibling.rs".to_string()),
+            "live base diff spuriously includes the sibling file: {live:?}"
+        );
+
+        // Diffing against the PINNED base (the cut-from commit) reports ONLY the
+        // task's own file — no spurious sibling deletion. This is the fix.
+        let pinned_diff = changed_files(wt.path(), &pinned).unwrap();
+        assert_eq!(
+            pinned_diff,
+            vec!["task.rs".to_string()],
+            "pinned base diff is exactly the task's own change: {pinned_diff:?}"
+        );
+        assert!(
+            !pinned_diff.contains(&"sibling.rs".to_string()),
+            "pinned base diff must NOT include the sibling file"
+        );
+
+        remove(rp, wt.path());
     }
 
     #[test]

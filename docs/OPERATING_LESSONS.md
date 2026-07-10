@@ -32,18 +32,24 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   daemon-internal calls. Consider a per-attempt wall-clock deadline spanning
   plan+check+execute, not just the execute PTY.
 
-### L2. The persistent journal has no schema migration — open
+### L2. The persistent journal has no schema migration — FIXED
 - **Observed:** `~/.local/share/maestro/journal.db` created by an older binary
   lacked the `repo_path` column; `delegate` failed with `sqlite error: table
   tasks has no column named repo_path`. The `/goal` skill sidesteps this by
   using an ephemeral `/tmp` XDG data dir per run (fresh schema each time).
 - **Impact:** a persistent journal breaks across binary upgrades; silent unless
   you know to wipe it.
-- **Incorporation:** add journal schema migrations (or a version check that
-  auto-migrates / rebuilds with a loud notice). Until then, document that a
-  schema bump requires resetting the journal.
+- **Incorporation:** LANDED. `schema::migrate` now detects two incompatible
+  cases and fails LOUD with a guided `Error::SchemaVersion` (instead of a raw
+  sqlite error): (a) a **pre-versioning legacy DB** (`user_version == 0` but user
+  tables already exist — the exact repo_path case), detected via `sqlite_master`,
+  and (b) a **newer DB** (`user_version > SCHEMA_VERSION`). Both messages point
+  the operator at resetting `journal.db`. A fresh DB still applies the v1 DDL +
+  stamps the version; re-running is idempotent. The daemon's `Server::start`
+  propagates the guided message with the db path. Tests in
+  `maestro-journal/src/schema.rs`.
 
-### L3. Don't move `base_ref` under an in-flight task — open (rule)
+### L3. Don't move `base_ref` under an in-flight task — FIXED
 - **Observed:** merging a completed task into `base_ref` while a *sibling* task
   still runs against it makes the gate diff the sibling's worktree against the
   **advanced tip**; the just-merged files appear as **deletions** outside the
@@ -52,23 +58,36 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   theseus-syntax ran against it → syntax failed on `crates/theseus-eval/*`
   deletions.
 - **Impact:** spurious task failures + wasted worker runs during parallel rounds.
-- **Incorporation:** compute the **scope-check diff against the concrete commit
-  the worktree was cut from** (pin `base_ref` at spawn for the scope check); the
-  *merge target* can still be the live tip. Only the scope diff must use the
-  pinned base. **Rule until fixed:** finish all tasks branched from a base before
-  merging any of them; exploit natural dependencies (a dependent task can't
-  start until the base settles) to keep merges safe.
+- **Incorporation:** LANDED. `delegate` resolves `base_ref` to the concrete
+  commit SHA it points at at spawn (`worktree::resolve_to_sha`) and threads that
+  pinned commit through the pipeline. Every attempt's worktree is cut from it AND
+  every diff (scope/allowlist, checks-failed, verifier structural, forensic
+  snapshot) is taken against it — never the live `base_ref` tip. The **merge
+  target** stays the live symbolic `base_ref` so `merge_task` can still
+  fast-forward it. A ref that can't be peeled to a commit falls back to the
+  symbolic ref (prior behavior). Regression test
+  `worktree::pinned_base_scope_diff_survives_base_advance` proves that advancing
+  the base after spawn does NOT produce a spurious scope violation. The old
+  operational rule (finish siblings before merging) is now belt-and-suspenders,
+  not required for correctness.
 
 ---
 
 ## Driven worker / CLI adapter
 
-### L4. Turn cap is execute-phase only; the plan phase is uncapped — note
+### L4. Turn cap is execute-phase only; the plan phase is uncapped — FIXED
 - **Observed:** the driven `claude` adapter enforces the turn cap only in the
   execute phase; the plan phase runs uncapped (a plan is "a single short turn").
 - **Impact:** a long or looping plan phase is unbounded (see also L1).
-- **Incorporation:** consider a plan-phase wall-clock/turn ceiling, or fold it
-  into the per-attempt deadline in L1.
+- **Incorporation:** LANDED. `run_json_phase` now takes an optional per-phase
+  wall-clock ceiling and tears the phase down once elapsed time since spawn
+  exceeds it — independent of activity, so it fires even when the idle watchdog
+  never would (new `JsonPhaseKind::WallClockExceeded`). The plan phase passes
+  `DrivenConfig.plan_ceiling` (derived by the daemon as 5× the watchdog, floored
+  at 5 min, overridable via `MAESTRO_PLAN_CEILING_SECONDS`); the execute phase
+  stays turn-capped. A plan-phase wall-clock exceed maps to `PlanRejected`
+  (terminal, zero edits). Test:
+  `claude::plan_phase_wall_clock_ceiling_tears_down_a_long_plan`.
 
 ### L5. Driven workers can't self-verify (cargo/nix not in `settings.json` allow) — open (spec rule applied)
 - **Observed:** driven workers inherit the operator's `~/.claude/settings.json`.
@@ -96,14 +115,21 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
 
 ## Gate / verification
 
-### L6. The gate must RUN the deliverable's tests, not just build — open (rule)
+### L6. The gate must RUN the deliverable's tests, not just build — partly FIXED (warning landed)
 - **Observed:** a light gate (build + clippy of one crate) never compiled the
   test files; 3 of 5 "verified" cards shipped with test-file defects that only a
   test-running gate catches.
 - **Impact:** false "verified" — defects slip past a build-only gate.
-- **Incorporation:** make "gate runs the acceptance test commands" a hard
-  default; warn on a spec whose `check_commands` only build (no test). The `/goal`
-  per-card gate must compile+run the card's tests.
+- **Incorporation:** the "warn on a build-only `check_commands`" half is LANDED.
+  `delegate` runs `check_commands_look_build_only` (pure heuristic: commands run
+  but none contain a test-runner token — cargo test/nextest, pytest, jest, go
+  test, npm test, …; biased toward NOT warning to avoid false alarms). On a hit
+  it warns NON-FATALLY — a `tracing::warn` for the operator plus an advisory
+  inlined in the `created` event payload (rides the advisor inbox without a new,
+  frozen event kind). The task still runs; the advisor stays in control. Tests in
+  `delegate.rs` (`build_only_check_commands_are_flagged`). NOT changed: making a
+  test-running gate a HARD default (that stays advisor/spec discipline + the
+  `/goal` per-card gate must compile+run the card's tests).
 
 ### L7. Gate hermeticity: scrub the daemon's environment — FIXED
 - **Observed:** maestro's own tests read the daemon's `XDG_CONFIG_HOME`; a task
@@ -140,6 +166,18 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   change's blast radius, not just the obvious file. Consider letting a worker
   *request* an allowlist widening (surfaced to the advisor) instead of silently
   failing.
+- **Status — allowlist-widening request DEFERRED (this pass):** the request
+  mechanism is a larger change than the L2/L3/L4/L6 items landed here. The clean
+  designs both have real cost: (a) a new terminal/event kind (e.g.
+  `scope_widen_requested`) collides with the FROZEN ADR-001 event taxonomy /
+  failure taxonomy and needs an ADR amendment; (b) parsing the worker's
+  natural-language "I need a wider allowlist" out of PTY output is brittle and
+  couples the daemon to model phrasing. The `driven_prompt` HARD-BOUNDARY text
+  (already landed) tells the worker to STOP and report rather than work around a
+  narrow allowlist, which is the low-risk lever. Recommended next step (own PR):
+  an ADR amendment adding a first-class `scope_widen_requested` event the worker
+  emits via a structured tool call, surfaced to the advisor's inbox — designed,
+  not rushed.
 
 ### L10. Profile/auth/setup notes for operators — docs
 - **Observed / how it works:** driven tier0 uses the local `claude` CLI's own
