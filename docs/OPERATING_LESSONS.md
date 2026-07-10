@@ -209,6 +209,24 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
 - **Incorporation:** an operator quickstart doc; always run `doctor` first;
   document the tier0-subscription vs API-tier auth split.
 
+### L14. Specs must instruct INCREMENTAL implementation, not monolithic turns — rule (advisor behavior)
+- **Observed:** a spec that asks a worker to implement a whole crate ("read the
+  frozen grammar and the core/eval crates carefully, then get it right in one
+  pass") pushes the driven model toward a single **giant generation turn** —
+  read everything, then emit the entire crate at once. Those turns run many
+  minutes and are hang-prone: theseus-syntax attempt 5's execute phase stalled on
+  one ~10-min generation turn (proc alive, idle on the API, no output), bounded
+  only by the 30-min watchdog. This is an **advisor behavioral bug**, not a
+  harness bug — the spec caused the monolithic turn.
+- **Impact:** slow, invisible progress; a single hung API turn wastes the whole
+  attempt; larger blast radius per turn.
+- **Incorporation:** advisor spec-authoring rule — instruct workers to implement
+  **incrementally**: one module/file at a time, many small edits, interleaving
+  reads and writes, never "emit the whole thing at once." Give an explicit build
+  order when the crate has natural layers (e.g. spans/AST → lexer → parser →
+  pretty → tests). Applied to the theseus-syntax spec (v3). Reflect in the
+  `maestro-advisor` skill's rules and the advisor CLAUDE_MD guidance.
+
 ---
 
 ## Merge / parallelism

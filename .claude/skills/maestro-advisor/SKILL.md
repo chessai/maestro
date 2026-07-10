@@ -132,6 +132,13 @@ Non-negotiables the daemon enforces:
 - **One task per delegation (L8).** Never bundle separable deliverables into one
   spec — it fails as a unit and one part's failure wastes the whole run. Split
   them; size `budget`/`lifetime_budget` to a single deliverable.
+- **Instruct INCREMENTAL implementation (L14).** A spec that says "read
+  everything, then get it right in one pass" pushes the driven model into a
+  single giant generation turn — slow, invisible, and hang-prone (one ~10-min API
+  turn can stall the attempt). In `instructions`, tell the worker to build
+  incrementally: one module/file at a time, many small edits, interleaving reads
+  and writes; give an explicit build order for layered crates (e.g. spans/AST →
+  lexer → parser → pretty → tests). Never "emit the whole thing at once."
 - **Size `file_allowlist` to the change's blast radius (L9).** Too narrow and a
   necessary refactor fails as `scope_violation` (or the worker splits a file to
   dodge it). Tight + "edit in place" for surgical fixes; directory-scoped
