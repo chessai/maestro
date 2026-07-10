@@ -150,6 +150,20 @@ pub fn create(repo_path: &Path, base_ref: &str, task_id: &str) -> Result<PathBuf
     let repo = repo_path.to_str().context("repo path is not valid UTF-8")?;
     let branch = format!("maestro/{task_id}");
 
+    // WORK-LOSS GUARD (same class as operating-lesson L15): the branch
+    // `maestro/<task_id>` may carry REAL committed work — the fix-in-place
+    // checkpoint the mechanical gate commits on `checks_failed`. On a tier
+    // ESCALATION the pipeline re-cuts a fresh worktree off `base_ref` (ADR-003:
+    // the bigger model re-approaches from base, it does NOT resume the smaller
+    // model's checkpoint), and the `git branch -D` below would DESTROY that
+    // committed checkpoint — unrecoverable if the escalated tier then can't run
+    // (the live case: tier-0 at 7/8 tests, tier-1 out of credits). Before
+    // deleting, PRESERVE any commits the branch has beyond `base_ref` to a durable
+    // salvage ref an advisor can `git log`/cherry-pick. This does NOT change
+    // escalation semantics (the fresh worktree still starts at base_ref); it only
+    // guarantees nothing committed is ever lost.
+    salvage_task_branch(repo, base_ref, task_id, &branch);
+
     // If a stale worktree dir exists (a prior crashed run OR a prior attempt in
     // the escalation loop, ADR-003: a fresh worktree per attempt off base_ref),
     // best-effort clear it so `git worktree add` does not refuse.
@@ -171,6 +185,93 @@ pub fn create(repo_path: &Path, base_ref: &str, task_id: &str) -> Result<PathBuf
     ])
     .with_context(|| format!("creating worktree for task {task_id}"))?;
     Ok(wt)
+}
+
+/// Before [`create`] force-deletes an existing `maestro/<task_id>` branch,
+/// PRESERVE its tip to a durable salvage ref IFF it carries commits beyond
+/// `base_ref` (real work — the fix-in-place checkpoint). Without this, a tier
+/// escalation's `git branch -D` silently DESTROYS the lower tier's committed
+/// near-complete implementation (the confirmed work-loss bug, same class as L15).
+///
+/// The salvage ref is `refs/maestro/salvage/<task_id>/<short_sha>` — the tip's
+/// short sha is embedded so repeated escalations of the SAME task never clobber
+/// each other's salvage (each checkpoint tip lands at its own ref). It lives
+/// under `refs/maestro/` (NOT `refs/heads/`), so it is never a branch the
+/// pipeline reuses/re-cuts/merges — it is a pure recovery anchor.
+///
+/// Best-effort but LOUD (mirrors the L15 philosophy): any git probe failure or a
+/// branch with NO commits beyond base is a silent no-op (nothing to save); a
+/// FAILURE to write the salvage ref when there IS work to save is logged at
+/// `error` (discoverability), but never wedges the task — `create` proceeds to
+/// re-cut regardless. On success emits a `tracing::info` recording the salvage
+/// ref + task id so it is discoverable in the daemon log.
+///
+/// `base_ref` may be a branch name, a tag, or a raw SHA — `<base_ref>..<branch>`
+/// resolves in all three cases (git peels the endpoints to commits).
+fn salvage_task_branch(repo: &str, base_ref: &str, task_id: &str, branch: &str) {
+    let branch_ref = format!("refs/heads/{branch}");
+
+    // The branch must exist AND resolve to a commit. Absent branch → nothing to
+    // salvage (the common first-attempt / fresh-cut case): silent no-op.
+    let Ok(tip) = git_c(repo, &["rev-parse", "--verify", "--quiet", &branch_ref]) else {
+        return;
+    };
+
+    // Does the branch carry commits BEYOND base_ref? `git rev-list base..branch`
+    // is empty when the branch is at/behind base (no checkpoint was committed —
+    // e.g. an escalation triggered by verifier failures with no `checks_failed`).
+    // A git error here (e.g. base_ref unresolvable) → treat as "cannot prove
+    // there is work" and skip: we do not want to spuriously salvage the whole
+    // history, and the delete is not our call to block.
+    let range = format!("{base_ref}..{branch}");
+    match git_c(repo, &["rev-list", &range]) {
+        Ok(revs) if !revs.trim().is_empty() => {} // there ARE task commits → salvage
+        Ok(_) => return,                          // branch == base: nothing committed beyond base
+        Err(e) => {
+            tracing::warn!(
+                task = task_id,
+                base_ref,
+                error = %e,
+                "salvage: could not compute base..branch to check for committed work; \
+                 skipping salvage (branch delete proceeds)"
+            );
+            return;
+        }
+    }
+
+    // Embed the tip's short sha so repeated escalations of the same task land at
+    // distinct salvage refs (no overwrite). `--short` gives a stable abbrev.
+    let short = git_c(repo, &["rev-parse", "--short", &tip]).unwrap_or_else(|_| {
+        // Fall back to a fixed-length prefix of the full sha if abbrev fails.
+        tip.chars().take(12).collect()
+    });
+    let salvage_ref = format!("refs/maestro/salvage/{task_id}/{short}");
+
+    // Point the salvage ref at the tip. This is a pure ref write — no worktree,
+    // no branch — so it cannot conflict with the re-cut that follows.
+    match git_c(repo, &["update-ref", &salvage_ref, &tip]) {
+        Ok(_) => {
+            tracing::info!(
+                task = task_id,
+                salvage_ref = %salvage_ref,
+                tip = %tip,
+                "salvage: preserved the task branch's committed checkpoint before \
+                 escalation re-cut; recover with `git log`/`git cherry-pick`"
+            );
+        }
+        Err(e) => {
+            // LOUD but non-fatal: we could not save the work, but wedging the task
+            // helps no one. The branch delete proceeds; the loss is at least noisy.
+            tracing::error!(
+                task = task_id,
+                salvage_ref = %salvage_ref,
+                tip = %tip,
+                error = %e,
+                "salvage: FAILED to preserve the task branch's committed checkpoint \
+                 before escalation re-cut — committed work may be lost"
+            );
+        }
+    }
 }
 
 /// `git add -A` in the worktree, then commit with `message` — but only if there
@@ -913,5 +1014,129 @@ mod tests {
         let err = merge_task_branch(repo.path(), "main", "absent").expect_err("missing branch");
         let msg = format!("{err:#}");
         assert!(msg.contains("missing") || msg.contains("nothing to merge"), "got: {msg}");
+    }
+
+    /// All salvage refs currently under `refs/maestro/salvage/<task_id>/`.
+    fn salvage_refs_for(repo: &Path, task_id: &str) -> Vec<String> {
+        let rp = repo.to_str().unwrap();
+        let prefix = format!("refs/maestro/salvage/{task_id}/");
+        git(&["-C", rp, "for-each-ref", "--format=%(refname)", &prefix])
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// The commit a ref points at (full sha), or None if the ref is absent.
+    fn ref_sha(repo: &Path, r: &str) -> Option<String> {
+        let rp = repo.to_str().unwrap();
+        git_c(rp, &["rev-parse", "--verify", "--quiet", r]).ok()
+    }
+
+    /// WORK-LOSS GUARD: a `maestro/<task_id>` branch carrying commits beyond
+    /// `base_ref` (the fix-in-place checkpoint) is PRESERVED to a durable salvage
+    /// ref before it is deleted, and the salvage ref carries the committed file.
+    #[test]
+    fn salvage_preserves_a_task_branch_with_commits_beyond_base() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let rps = rp.to_str().unwrap();
+        // A task branch with one committed file beyond `main` (the checkpoint).
+        let tip = add_task_branch_writing(rp, "salv1", "impl.rs", "// near-complete\n");
+
+        salvage_task_branch(rps, "main", "salv1", "maestro/salv1");
+
+        let refs = salvage_refs_for(rp, "salv1");
+        assert_eq!(refs.len(), 1, "exactly one salvage ref, got {refs:?}");
+        assert_eq!(
+            ref_sha(rp, &refs[0]).as_deref(),
+            Some(tip.as_str()),
+            "salvage ref points at the checkpoint tip"
+        );
+        // The committed file is recoverable through the salvage ref.
+        let show = git(&["-C", rps, "show", &format!("{}:impl.rs", refs[0])]).unwrap();
+        assert!(show.contains("near-complete"), "salvage ref carries impl.rs, got: {show}");
+
+        // Now the (real) force-delete can proceed and the work is still recoverable.
+        let _ = git(&["-C", rps, "branch", "-D", "maestro/salv1"]);
+        assert!(
+            ref_sha(rp, &refs[0]).is_some(),
+            "salvage survives the branch delete"
+        );
+    }
+
+    /// A branch with NO commits beyond base (e.g. an escalation from repeated
+    /// verifier failures, no `checks_failed` checkpoint) is NOT salvaged — there is
+    /// nothing committed to lose, and we must not spuriously anchor base itself.
+    #[test]
+    fn salvage_is_noop_when_branch_has_no_commits_beyond_base() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let rps = rp.to_str().unwrap();
+        // A task branch cut at `main` with NO extra commit.
+        git(&["-C", rps, "branch", "maestro/nowork", "main"]).unwrap();
+
+        salvage_task_branch(rps, "main", "nowork", "maestro/nowork");
+
+        assert!(
+            salvage_refs_for(rp, "nowork").is_empty(),
+            "no salvage ref for a branch at base"
+        );
+    }
+
+    /// An absent branch (the common first-attempt / fresh-cut case) is a silent
+    /// no-op — nothing to salvage.
+    #[test]
+    fn salvage_is_noop_when_branch_absent() {
+        let repo = init_repo();
+        let rp = repo.path();
+        salvage_task_branch(rp.to_str().unwrap(), "main", "ghost", "maestro/ghost");
+        assert!(salvage_refs_for(rp, "ghost").is_empty(), "no salvage ref for an absent branch");
+    }
+
+    /// Edge: `base_ref` is a raw SHA (advanced usage — worktree cut off a pinned
+    /// commit, not a branch). The `base..branch` range still resolves, so the
+    /// checkpoint is salvaged exactly as with a branch base.
+    #[test]
+    fn salvage_works_with_base_ref_as_a_sha() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let rps = rp.to_str().unwrap();
+        let base_sha = head_of(rp, "main");
+        let tip = add_task_branch_writing(rp, "shabase", "impl.rs", "// x\n");
+
+        salvage_task_branch(rps, &base_sha, "shabase", "maestro/shabase");
+
+        let refs = salvage_refs_for(rp, "shabase");
+        assert_eq!(refs.len(), 1, "salvaged with a SHA base, got {refs:?}");
+        assert_eq!(ref_sha(rp, &refs[0]).as_deref(), Some(tip.as_str()));
+    }
+
+    /// Repeated escalations of the SAME task must not clobber each other's salvage:
+    /// each distinct checkpoint tip lands at its own `refs/.../<short_sha>` ref.
+    #[test]
+    fn repeated_escalations_produce_distinct_salvage_refs() {
+        let repo = init_repo();
+        let rp = repo.path();
+        let rps = rp.to_str().unwrap();
+
+        // Escalation 1: a checkpoint with content A.
+        let tip1 = add_task_branch_writing(rp, "multi", "impl.rs", "// A\n");
+        salvage_task_branch(rps, "main", "multi", "maestro/multi");
+        // (create would delete the branch here; simulate that.)
+        git(&["-C", rps, "branch", "-D", "maestro/multi"]).unwrap();
+
+        // Escalation 2: a DIFFERENT checkpoint (different content → different sha).
+        let tip2 = add_task_branch_writing(rp, "multi", "impl.rs", "// B different\n");
+        assert_ne!(tip1, tip2, "the two checkpoints have distinct tips");
+        salvage_task_branch(rps, "main", "multi", "maestro/multi");
+
+        let refs = salvage_refs_for(rp, "multi");
+        assert_eq!(refs.len(), 2, "two escalations → two distinct salvage refs, got {refs:?}");
+        let salvaged: std::collections::HashSet<String> =
+            refs.iter().filter_map(|r| ref_sha(rp, r)).collect();
+        assert!(salvaged.contains(&tip1), "first checkpoint preserved");
+        assert!(salvaged.contains(&tip2), "second checkpoint preserved");
     }
 }

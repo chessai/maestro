@@ -2094,10 +2094,14 @@ fn run_gate_and_verify(
             // commit error is logged, not fatal.
             //
             // On ESCALATION the carryover is dropped and `run_attempt` cuts a FRESH
-            // worktree off `base_ref` (`worktree::create` force-deletes the task
-            // branch first), so this fix-commit never survives a tier bump — a
-            // bigger model always re-approaches from base (ADR-003 / decision
-            // table). Only a same-tier `checks_failed` retry resumes from it.
+            // worktree off `base_ref` — a bigger model always re-approaches from
+            // base (ADR-003 / decision table), so this fix-commit is NOT resumed by
+            // the escalated attempt. But it is NO LONGER LOST: before force-deleting
+            // the task branch, `worktree::create` calls `salvage_task_branch`, which
+            // preserves this committed checkpoint to a durable
+            // `refs/maestro/salvage/<task_id>/<sha>` ref (an advisor can `git log`/
+            // cherry-pick it). Only a same-tier `checks_failed` retry resumes from
+            // the checkpoint directly; escalation preserves-then-re-cuts.
             if let Err(e) = worktree::commit_paths(
                 worktree_path,
                 &changed,
