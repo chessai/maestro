@@ -680,6 +680,48 @@ fn validate_spec(spec: &TaskSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a spec's `check_commands` look BUILD-ONLY — they run at least one
+/// command but none of them execute a test suite (operating-lesson L6). A
+/// build-only gate compiles the deliverable but never runs its tests, so a task
+/// can be "verified" while shipping test-file defects. This is a pure, heuristic
+/// detector used only to WARN (never to reject): the advisor stays in control.
+///
+/// Returns `false` when there are no check commands at all (nothing to warn
+/// about — an empty gate is a separate, pre-existing concern) or when ANY command
+/// contains a recognizable test-runner token. The match is case-insensitive and
+/// substring-based; it errs toward NOT warning (no false alarms) — e.g. a wrapper
+/// script or a Makefile target like `make check` that internally runs tests is
+/// assumed to test. Recognized tokens cover the common runners across ecosystems.
+fn check_commands_look_build_only(check_commands: &[String]) -> bool {
+    if check_commands.is_empty() {
+        return false;
+    }
+    // Test-runner signals. Substring, lowercased. Kept deliberately broad so a
+    // command that plausibly runs tests suppresses the warning (avoid false
+    // positives that would train operators to ignore it).
+    const TEST_TOKENS: &[&str] = &[
+        "test",     // cargo test, go test, npm test, dotnet test, ctest, `make test`
+        "nextest",  // cargo nextest
+        "pytest",   // python
+        "unittest", // python -m unittest
+        "jest",     // js
+        "vitest",   // js
+        "mocha",    // js
+        "rspec",    // ruby
+        "phpunit",  // php
+        "check",    // `make check`, `cargo check` is build-ish but `make check` tests;
+                    // erring toward not-warning is the intended bias
+        "spec",     // *_spec targets
+        "junit",    // java
+        "gradle",   // gradle test tasks (broad; suppresses to avoid false alarm)
+    ];
+    // Build-only iff NO command contains any test token.
+    !check_commands.iter().any(|cmd| {
+        let lc = cmd.to_lowercase();
+        TEST_TOKENS.iter().any(|tok| lc.contains(tok))
+    })
+}
+
 /// Append a task event under the shared journal lock. Errors are logged, not
 /// propagated, so the worker's own control flow stays linear.
 fn emit(state: &DelegationState, task_id: &str, kind: EventKind, payload: Option<&str>) {
@@ -800,7 +842,32 @@ pub fn delegate(
             .map_err(|e| DelegateError::Internal(format!("create_task: {e}")))?
     };
 
-    emit(state, &task_id, EventKind::Created, None);
+    // Warn (never reject) when the spec's check_commands look build-only — they
+    // compile the deliverable but run no tests, so a "verified" verdict can hide
+    // test-file defects (operating-lesson L6). Surface it BOTH to the operator
+    // (tracing) and to the advisor (inlined in the `created` event payload so it
+    // rides the inbox without a new event kind). The advisor stays in control.
+    let created_payload = if check_commands_look_build_only(&spec.check_commands) {
+        tracing::warn!(
+            task = %task_id,
+            check_commands = ?spec.check_commands,
+            "spec check_commands look build-only (no test runner detected); a build-only \
+             gate can report 'verified' while shipping test defects (L6)"
+        );
+        Some(
+            serde_json::json!({
+                "warning": "check_commands_build_only",
+                "message": "check_commands compile but run no tests; the gate can report \
+                            'verified' while test-file defects slip through. Add a \
+                            test-running command (e.g. `cargo test`/`cargo nextest run`) \
+                            to the acceptance gate.",
+            })
+            .to_string(),
+        )
+    } else {
+        None
+    };
+    emit(state, &task_id, EventKind::Created, created_payload.as_deref());
 
     // 3. Spawn the background worker.
     let state = Arc::clone(state);
@@ -2102,6 +2169,29 @@ mod tests {
             check: check.into(),
             kind,
         }
+    }
+
+    // L6: build-only check_commands are flagged; anything that runs tests is not.
+    #[test]
+    fn build_only_check_commands_are_flagged() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // No commands → nothing to warn about (empty gate is a separate concern).
+        assert!(!check_commands_look_build_only(&[]));
+
+        // Pure build/lint gates → build-only.
+        assert!(check_commands_look_build_only(&s(&["cargo build"])));
+        assert!(check_commands_look_build_only(&s(&["cargo build --release", "cargo clippy"])));
+        assert!(check_commands_look_build_only(&s(&["nix build .#pkg"])));
+
+        // Any test-running command suppresses the warning (case-insensitive).
+        assert!(!check_commands_look_build_only(&s(&["cargo test"])));
+        assert!(!check_commands_look_build_only(&s(&["cargo build", "cargo test --all"])));
+        assert!(!check_commands_look_build_only(&s(&["cargo nextest run"])));
+        assert!(!check_commands_look_build_only(&s(&["CARGO_TEST=1 make TEST"])));
+        assert!(!check_commands_look_build_only(&s(&["pytest -q"])));
+        assert!(!check_commands_look_build_only(&s(&["npm test"])));
+        assert!(!check_commands_look_build_only(&s(&["make check"]))); // biased to not-warn
     }
 
     #[test]
