@@ -6,6 +6,8 @@
 //! edits. This is an early-abort efficiency gate, not the security control —
 //! the load-bearing scope control is the post-hoc allowlist diff (ADR-003).
 
+use std::time::Duration;
+
 use maestro_journal::spec::TaskSpec;
 use serde_json::{json, Value};
 
@@ -241,8 +243,22 @@ fn parse_verdict(resp: &Value) -> Result<PlanVerdict, String> {
 }
 
 /// Send one Messages API request and parse the JSON response.
+///
+/// The call is bounded by connect + overall timeouts. This is load-bearing:
+/// `check()` runs in-process on the driven thread *between* the plan and
+/// execute phases, and nothing else watchdogs it — an unbounded request that
+/// hangs (connection established, no response) would block `check()` forever,
+/// stranding the task in `Iterating` with no worker process and no terminal
+/// event. On timeout `ureq` returns `Transport`, which `check()` maps to a
+/// permissive `Accept` (the post-hoc allowlist diff remains the scope control),
+/// so a slow/hung checker fails safe instead of wedging the task.
 fn send(url: &str, api_key: &str, body: &Value) -> Result<Value, String> {
-    let resp = ureq::post(url)
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build();
+    let resp = agent
+        .post(url)
         .set("x-api-key", api_key)
         .set("anthropic-version", ANTHROPIC_VERSION)
         .set("content-type", "application/json")
