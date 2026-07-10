@@ -180,7 +180,7 @@ fn m_adr009_stall_detected_and_auto_recovered() {
 mkdir -p src
 echo 'pub fn stall_test() {}' > src/impl.rs
 # Echo the plan line so the plan-echo gate accepts.
-echo "PLAN: implement the file and stall"
+echo "PLAN: create the implementation file, then stall"
 # Go silent — this is the stall the daemon should detect.
 sleep 600
 "#,
@@ -199,7 +199,7 @@ mkdir -p src
 if [ ! -f src/impl.rs ]; then
   echo 'pub fn stall_test() {}' > src/impl.rs
 fi
-echo "PLAN: continue from stall recovery"
+echo "PLAN: create/continue the file from stall recovery"
 "#,
     );
 

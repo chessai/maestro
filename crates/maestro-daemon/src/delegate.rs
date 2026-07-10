@@ -1207,6 +1207,12 @@ fn run_pipeline(
     // specific error instead of rewriting. Cleared after each attempt consumes
     // it; only ever set from a `checks_failed` outcome (never verify_failed).
     let mut pending_check_fix: Option<CheckFailure> = None;
+    // ADR-009 Phase 2: bound stall auto-recoveries so a permanently-stalling
+    // worker cannot be killed+retried forever (adversarial review). After the
+    // cap the task is blocked for the advisor rather than looping to the coarse
+    // wall-clock ceiling.
+    let mut stall_retries = 0u32;
+    const MAX_STALL_RETRIES: u32 = 3;
 
     loop {
         // BEFORE each attempt: enforce the lifetime ceilings (ADR-003). A task
@@ -1240,6 +1246,20 @@ fn run_pipeline(
             AttemptOutcome::Passed => return Ok(()),
             AttemptOutcome::ScopeViolation => return Ok(()),
             AttemptOutcome::StallRecovered { has_edits } => {
+                // Bound auto-recoveries (adversarial review): a worker that keeps
+                // stalling must not be killed+retried forever. After the cap,
+                // block for the advisor instead of looping to the wall-clock ceiling.
+                stall_retries += 1;
+                if stall_retries > MAX_STALL_RETRIES {
+                    let blocked_payload = serde_json::json!({
+                        "reason": "stall_recovery_exhausted",
+                        "stall_recoveries": stall_retries - 1,
+                        "partial_diff": last_failed_diff.as_deref().map(cap_diff),
+                    })
+                    .to_string();
+                    emit(state, task_id, EventKind::Blocked, Some(&blocked_payload));
+                    return Ok(());
+                }
                 // ADR-009 Phase 2: the daemon killed a stalled driven session and
                 // is retrying same-tier. NOT escalation fuel — does NOT increment
                 // `tier_failures`. If the worker had edits, set up fix-in-place
@@ -1591,10 +1611,19 @@ fn stall_timeout_duration(rp: &ResolvedProfile) -> Option<Duration> {
         rp.monitoring.stall_timeout_seconds
     };
     if secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(secs))
+        return None;
     }
+    // S1 (adversarial review): stall detection must fire BEFORE the coarse
+    // watchdog, else the watchdog wins the race and the task fails as
+    // `session_wedged` instead of auto-recovering — silently defeating the
+    // feature. Clamp the stall timeout to stay below the watchdog.
+    let watchdog_secs = (rp.watchdog_minutes as u64).saturating_mul(60);
+    let secs = if watchdog_secs > 30 {
+        secs.min(watchdog_secs - 30)
+    } else {
+        secs
+    };
+    Some(Duration::from_secs(secs.max(1)))
 }
 
 /// The PLAN-PHASE wall-clock ceiling for the structured `claude` adapter
