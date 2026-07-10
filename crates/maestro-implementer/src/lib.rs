@@ -25,8 +25,9 @@ mod verifier;
 pub use anthropic::{build_request_body, AnthropicBackend};
 pub use mock::MockBackend;
 pub use verifier::{
-    build_verify_request_body, AnthropicVerifier, MockVerifier, NoCommandRunner, VerifierBackend,
-    VerifierCommandRun, VerifierCommandRunner, VerifyOutcome, VerifyTask,
+    build_verify_request_body, build_verifier_prompt, parse_verdict_from_text, AnthropicVerifier,
+    DrivenVerifier, MockVerifier, NoCommandRunner, VerifierBackend, VerifierCommandRun,
+    VerifierCommandRunner, VerifyOutcome, VerifyTask,
 };
 
 use std::path::{Path, PathBuf};

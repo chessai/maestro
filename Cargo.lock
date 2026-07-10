@@ -825,6 +825,7 @@ dependencies = [
 name = "maestro-implementer"
 version = "0.0.0"
 dependencies = [
+ "maestro-driver",
  "maestro-journal",
  "serde",
  "serde_json",

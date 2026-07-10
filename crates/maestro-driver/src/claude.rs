@@ -115,6 +115,11 @@ struct JsonPhaseOutcome {
     /// concatenated (NOT just the first assistant event). Only meaningful for
     /// phase 1; the execute phase ignores it.
     plan_text: String,
+    /// ALL assistant text concatenated, IGNORING any `ExitPlanMode` submission.
+    /// The read-only verifier reads this (never `plan_text`): an `ExitPlanMode`
+    /// plan string must not be able to override the model's real verdict text
+    /// (adversarial review — that path was a spurious-PASS vector).
+    all_text: String,
     metering: PhaseMetering,
 }
 
@@ -269,6 +274,114 @@ pub fn run_claude_driven(
     Ok((handle, join))
 }
 
+/// The outcome of a SINGLE read-only `claude` phase (used by the verifier, which
+/// has no execute phase): the terminal reason, the final assistant text the model
+/// emitted, and the phase's metering. Distinct from [`DrivenResult`] because a
+/// verifier does not commit edits and needs the raw assistant text (its fenced
+/// JSON verdict), not a plan.
+#[derive(Debug, Clone)]
+pub struct ReadOnlyOutcome {
+    /// Why the phase ended.
+    pub reason: EndReason,
+    /// The per-phase PTY log file.
+    pub log_path: PathBuf,
+    /// ALL assistant `text` blocks concatenated (newline-separated per turn) —
+    /// the model's prose, from which the caller extracts the fenced JSON verdict.
+    /// Empty if the model emitted no text (e.g. a spawn error).
+    pub assistant_text: String,
+    /// Best-effort turn count (`result.num_turns` if reported, else assistant
+    /// events observed).
+    pub turns: u32,
+    /// Input tokens reported by the `result` event, when known.
+    pub tokens_in: Option<u64>,
+    /// Output tokens reported by the `result` event, when known.
+    pub tokens_out: Option<u64>,
+}
+
+/// Drive the `claude` CLI as a SINGLE read-only (`--permission-mode plan`) phase,
+/// synchronously (this call blocks until the phase ends), and return the model's
+/// final assistant text plus metering.
+///
+/// This is the verifier's driver (ADR-002): it reuses the exact PTY +
+/// stream-json machinery of [`run_claude_driven`]'s plan phase — same
+/// `run_json_phase`, same event parser, same `MODE_PLAN` (so the CLI cannot edit)
+/// — but WITHOUT a second (execute) phase, a plan checker, or a turn cap. The
+/// verifier's read-only guarantee is structural: `MODE_PLAN` forbids file edits,
+/// and the daemon runs it in a throwaway checkout whose `.git` is severed.
+///
+/// `program`/`args` come from the role (e.g. `program="claude"`,
+/// `args=["--print"]`); `cwd` is the throwaway checkout; `watchdog` bounds no-
+/// output stalls and `wall_clock` (when `Some`) bounds total elapsed time even
+/// under active output. `env_remove` strips provider API keys for a
+/// subscription-authenticated CLI (so it never bills per-token). No external-kill
+/// channel is wired: the phase is bounded by the watchdog / wall-clock only.
+#[allow(clippy::too_many_arguments)]
+pub fn run_claude_verify_readonly(
+    program: &str,
+    args: &[String],
+    prompt: &str,
+    cwd: &Path,
+    log_path: &Path,
+    watchdog: Duration,
+    wall_clock: Option<Duration>,
+    env_remove: &[String],
+) -> ReadOnlyOutcome {
+    // A never-fired kill channel and an owned pid slot: the read-only verifier
+    // phase has no break-glass kill path (it is bounded + short). The receiver is
+    // kept alive for the phase's duration; nothing ever sends on `_kill_tx`.
+    let (_kill_tx, kill_rx) = std::sync::mpsc::channel::<KillKind>();
+    let pid_slot: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+
+    let out = run_json_phase(
+        program,
+        args,
+        MODE_PLAN,
+        prompt,
+        cwd,
+        log_path,
+        watchdog,
+        // No turn cap: the verifier emits a report in a bounded number of turns.
+        None,
+        wall_clock,
+        // Subscription (unmetered): no `--max-budget-usd`.
+        None,
+        &kill_rx,
+        &pid_slot,
+        env_remove,
+    );
+
+    let m = &out.metering;
+    let reason = match out.kind {
+        JsonPhaseKind::Exited(Some(0)) => EndReason::Completed,
+        JsonPhaseKind::Exited(code) => {
+            EndReason::Failed(format!("claude verify phase exited non-zero: {code:?}"))
+        }
+        JsonPhaseKind::Killed(kind) => EndReason::Killed(kind),
+        JsonPhaseKind::Wedged => EndReason::Wedged,
+        JsonPhaseKind::WallClockExceeded => {
+            EndReason::Failed("claude verify phase exceeded its wall-clock ceiling".into())
+        }
+        // No turn cap is set, so this cannot occur; fail safe rather than panic.
+        JsonPhaseKind::TurnCapExceeded => {
+            EndReason::Failed("claude verify phase hit a turn cap unexpectedly".into())
+        }
+        JsonPhaseKind::SpawnError(e) => EndReason::Failed(e),
+    };
+
+    ReadOnlyOutcome {
+        reason,
+        log_path: log_path.to_path_buf(),
+        // The verifier reads the model's raw PROSE (its fenced JSON verdict) —
+        // `all_text`, NEVER `plan_text`. `plan_text` prefers an `ExitPlanMode`
+        // submission, which a model could use to override its real verdict text
+        // with a pass block (adversarial review: a spurious-PASS vector).
+        assistant_text: out.all_text,
+        turns: m.turns(),
+        tokens_in: m.tokens_in,
+        tokens_out: m.tokens_out,
+    }
+}
+
 /// Build a single-phase [`DrivenResult`] carrying that phase's metering.
 fn result(reason: EndReason, log_path: PathBuf, turns: u32, m: &PhaseMetering) -> DrivenResult {
     DrivenResult {
@@ -372,6 +485,7 @@ fn run_json_phase(
             return JsonPhaseOutcome {
                 kind: JsonPhaseKind::SpawnError(e),
                 plan_text: String::new(),
+                all_text: String::new(),
                 metering: PhaseMetering::default(),
             }
         }
@@ -454,9 +568,11 @@ fn run_json_phase(
 
     // `pty` drops here: reader joined, master/writer closed.
     let metering = state.metering.clone();
+    let all_text = state.all_text.clone();
     JsonPhaseOutcome {
         kind,
         plan_text: state.plan(),
+        all_text,
         metering,
     }
 }

@@ -460,6 +460,318 @@ impl VerifierBackend for AnthropicVerifier {
     }
 }
 
+/// The default no-output stall timeout for the driven verifier's CLI phase.
+const DRIVEN_VERIFY_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(300);
+/// The default absolute wall-clock ceiling for the driven verifier's CLI phase —
+/// bounds an actively-emitting-but-looping session the idle watchdog would miss.
+const DRIVEN_VERIFY_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A verifier that produces the structured verdict by DRIVING the local
+/// subscription `claude` CLI read-only (ADR-002), rather than calling the
+/// Anthropic API. This lets verification run with NO API credits: the CLI
+/// authenticates via its subscription.
+///
+/// It runs the CLI in a SINGLE `--permission-mode plan` phase (via
+/// [`maestro_driver::run_claude_verify_readonly`]) in a throwaway checkout, so
+/// the model cannot edit anything (read-only is structural: plan mode forbids
+/// edits, and the checkout's `.git` is severed). The prompt (built by
+/// [`build_verifier_prompt`]) carries the acceptance criteria, the diff, the
+/// gate output, and prior reports, and instructs the model to end with exactly
+/// one fenced ```json verdict block. The final assistant text is parsed by
+/// [`parse_verdict_from_text`] into a [`ReportBody`], enforcing the ADR-002
+/// fail-requires-blocker invariant.
+///
+/// The `runner` argument to [`VerifierBackend::verify`] is IGNORED: this backend
+/// gathers evidence through the CLI's own read-only tools inside the checkout,
+/// not through the daemon's `run_command` seam, so `commands_run` is left empty
+/// (the daemon overrides `commands_run` from its authoritative records on the API
+/// path; on the driven path there are no daemon-recorded runs).
+pub struct DrivenVerifier {
+    /// The CLI program to spawn (e.g. `"claude"`, or `"bash"` in tests).
+    program: String,
+    /// Arguments before the injected stream-json flags (e.g. `["--print"]`, or a
+    /// fake-script path in tests).
+    args: Vec<String>,
+    /// The directory the CLI runs in — the throwaway checkout (severed `.git`).
+    /// `None` when the daemon could not build a checkout; the CLI then runs in a
+    /// fresh empty tempdir it makes itself (it still judges from diff+gate text).
+    cwd: Option<std::path::PathBuf>,
+    /// Env-var names to strip from the child (subscription CLIs: drop API keys so
+    /// they never bill per-token).
+    env_remove: Vec<String>,
+    /// No-output stall watchdog.
+    watchdog: std::time::Duration,
+    /// Absolute wall-clock ceiling for the phase.
+    wall_clock: std::time::Duration,
+}
+
+impl DrivenVerifier {
+    /// Build a driven verifier for a `driven_cli` verifier role.
+    ///
+    /// `program`/`args` come from the role's `command`/`args`; `cwd` is the
+    /// throwaway checkout the daemon prepared (severed from the repo). `env_remove`
+    /// strips provider API keys for a subscription CLI. Timeouts default to
+    /// [`DRIVEN_VERIFY_WATCHDOG`] / [`DRIVEN_VERIFY_WALL_CLOCK`] via
+    /// [`DrivenVerifier::new`]; [`DrivenVerifier::with_timeouts`] overrides them
+    /// (tests use short values).
+    pub fn new(
+        program: String,
+        args: Vec<String>,
+        cwd: Option<std::path::PathBuf>,
+        env_remove: Vec<String>,
+    ) -> Self {
+        Self::with_timeouts(
+            program,
+            args,
+            cwd,
+            env_remove,
+            DRIVEN_VERIFY_WATCHDOG,
+            DRIVEN_VERIFY_WALL_CLOCK,
+        )
+    }
+
+    /// Like [`DrivenVerifier::new`] but with explicit timeouts.
+    pub fn with_timeouts(
+        program: String,
+        args: Vec<String>,
+        cwd: Option<std::path::PathBuf>,
+        env_remove: Vec<String>,
+        watchdog: std::time::Duration,
+        wall_clock: std::time::Duration,
+    ) -> Self {
+        DrivenVerifier {
+            program,
+            args,
+            cwd,
+            env_remove,
+            watchdog,
+            wall_clock,
+        }
+    }
+}
+
+impl VerifierBackend for DrivenVerifier {
+    fn verify(
+        &self,
+        task: &VerifyTask,
+        _runner: &dyn VerifierCommandRunner,
+    ) -> Result<VerifyOutcome, ImplementerError> {
+        let prompt = build_verifier_prompt(task);
+
+        // The CLI's cwd: the daemon-prepared throwaway checkout, else a fresh
+        // empty tempdir the verifier makes itself (kept alive for the phase). The
+        // model still judges from the diff + gate text embedded in the prompt.
+        let (cwd, _tmp): (std::path::PathBuf, Option<std::path::PathBuf>) = match &self.cwd {
+            Some(p) => (p.clone(), None),
+            None => {
+                let t = std::env::temp_dir().join(format!(
+                    "maestro-driven-verify-{}",
+                    std::process::id(),
+                ));
+                // Best-effort; a create failure still runs with temp_dir as cwd.
+                let _ = std::fs::create_dir_all(&t);
+                (t.clone(), Some(t))
+            }
+        };
+
+        // A per-run log file alongside the cwd (best-effort location).
+        let log_path = cwd.join("maestro-verify.log");
+
+        let outcome = maestro_driver::run_claude_verify_readonly(
+            &self.program,
+            &self.args,
+            &prompt,
+            &cwd,
+            &log_path,
+            self.watchdog,
+            Some(self.wall_clock),
+            &self.env_remove,
+        );
+
+        // A non-clean terminal (spawn error, wedge, wall-clock, kill, non-zero
+        // exit) is a verifier CRASH, mapped to a retryable error (ADR-002: a
+        // crash retries once, then `internal_error`). An empty transcript on a
+        // "clean" exit is likewise a crash (no verdict emitted).
+        match outcome.reason {
+            maestro_driver::EndReason::Completed => {}
+            other => {
+                return Err(ImplementerError::Protocol(format!(
+                    "driven verifier CLI did not complete cleanly: {other:?}"
+                )));
+            }
+        }
+
+        let report = parse_verdict_from_text(&outcome.assistant_text)?;
+
+        Ok(VerifyOutcome {
+            report,
+            turns: outcome.turns,
+            tokens_in: outcome.tokens_in.unwrap_or(0),
+            tokens_out: outcome.tokens_out.unwrap_or(0),
+        })
+    }
+}
+
+/// Build the driven verifier's prompt: the same skeptical framing + evidence as
+/// the API path ([`user_message_text`] + the API system prompt), but ending with
+/// an instruction to emit the verdict as EXACTLY ONE fenced ```json block (there
+/// are no API tools on the driven path).
+///
+/// Pure (no I/O), so it is unit-testable without the CLI.
+pub fn build_verifier_prompt(task: &VerifyTask) -> String {
+    let mut text = String::new();
+
+    // The skeptical framing (mirrors the API system prompt), adapted: the driven
+    // model MAY read files / run read-only bash in its checkout to gather
+    // evidence, but it CANNOT edit and it reports via a fenced JSON block, not a
+    // tool call.
+    text.push_str(
+        "You are a code-change verifier. You did NOT write this code. Judge whether the \
+         provided unified DIFF satisfies each acceptance criterion, using the mechanical-gate \
+         command output as evidence. Be skeptical: do not accept a criterion as met unless the \
+         diff plainly demonstrates it, and watch for out-of-scope changes. You CANNOT edit any \
+         files. You MAY read files or run read-only commands in your working directory (a \
+         throwaway checkout) to gather evidence.\n\n",
+    );
+
+    // The evidence block: title, criteria, diff, gate output, prior reports —
+    // reuse the API path's exact rendering so both backends judge from identical
+    // material.
+    text.push_str(&user_message_text(task));
+
+    // The verdict instruction: EXACTLY ONE fenced json block, nothing after it,
+    // with the schema inline (ADR-002 frozen shape).
+    text.push_str(
+        "\n---\n\
+         When you are done, emit your verdict as EXACTLY ONE fenced ```json code block \
+         matching the schema below, and output NOTHING after that block. Do not wrap it in \
+         prose after the closing fence.\n\n\
+         Schema:\n\
+         ```json\n\
+         {\n\
+         \x20 \"verdict\": \"pass | fail\",\n\
+         \x20 \"findings\": [\n\
+         \x20   { \"severity\": \"blocker | concern | note\", \"criterion_id\": \"<id> | null\", \
+         \"evidence\": \"<verbatim evidence>\" }\n\
+         \x20 ],\n\
+         \x20 \"out_of_scope_diff\": false,\n\
+         \x20 \"commands_run\": []\n\
+         }\n\
+         ```\n\n\
+         Rules: `verdict` is \"pass\" or \"fail\". A \"fail\" verdict REQUIRES at least one \
+         finding with severity \"blocker\". `criterion_id` is the acceptance-criterion id the \
+         finding relates to, or null. Leave `commands_run` as an empty array.\n",
+    );
+
+    text
+}
+
+/// Parse the driven CLI's final assistant text into a [`ReportBody`].
+///
+/// Extraction rule (the load-bearing, fragile part):
+/// 1. Scan for ALL fenced code blocks whose info string is `json` (``` ```json```
+///    … ``` ``` ```), in order.
+/// 2. Take the LAST such block whose contents parse as a JSON object with a
+///    `verdict` field — the model is instructed to end with exactly one verdict
+///    block, and a trailing narrative is common; taking the last verdict block
+///    tolerates earlier illustrative/schema blocks quoted in the reasoning.
+/// 3. If NO ```json block parses into a report, fall back to the LAST balanced
+///    top-level `{…}` object in the text that parses into a report (defensive: a
+///    model that forgot the fence but still emitted the object).
+/// 4. `serde_json::from_str` into a [`ReportBody`]; enforce the ADR-002
+///    fail-requires-blocker invariant via [`parse_report`] (synthesizing a
+///    blocker rather than rejecting a genuine fail).
+///
+/// A missing/invalid verdict block is an [`ImplementerError::Protocol`] error
+/// (the daemon retries a verifier crash once, then fails `internal_error`).
+///
+/// Pure (no I/O), so it is unit-testable EXHAUSTIVELY without the CLI.
+pub fn parse_verdict_from_text(text: &str) -> Result<ReportBody, ImplementerError> {
+    // SECURITY (adversarial review): a verifier that turns a genuine FAIL into a
+    // PASS ships broken code, so this parser is FAIL-CLOSED. Only fenced ```json
+    // blocks whose `verdict` is EXACTLY "pass" or "fail" count as a verdict (a
+    // quoted schema like "pass | fail" does not). Then:
+    //   * 0 verdict blocks              → Protocol error (retry; NEVER a default pass)
+    //   * blocks disagree on the verdict → ambiguous → Protocol error (fail-closed)
+    //   * all agree (incl. exactly one) → parse it
+    // There is deliberately NO unfenced fallback: a bare `{"verdict":"pass"}` in
+    // prose — e.g. echoed from the diff under review, or an illustrative example —
+    // must never be treated as the verdict.
+    let blocks: Vec<Value> = fenced_json_blocks(text)
+        .iter()
+        .filter_map(|block| serde_json::from_str::<Value>(block.trim()).ok())
+        .filter(|v| valid_verdict(v).is_some())
+        .collect();
+
+    if blocks.is_empty() {
+        return Err(ImplementerError::Protocol(
+            "driven verifier emitted no parseable ```json verdict block \
+             (verdict must be exactly \"pass\" or \"fail\")"
+                .into(),
+        ));
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        blocks.iter().filter_map(valid_verdict).collect();
+    if distinct.len() > 1 {
+        return Err(ImplementerError::Protocol(
+            "driven verifier emitted conflicting verdict blocks (ambiguous); the \
+             model must output EXACTLY ONE ```json verdict block"
+                .into(),
+        ));
+    }
+    parse_report(&blocks[0])
+}
+
+/// The verdict string of `v` iff it is exactly `"pass"` or `"fail"` — so a quoted
+/// schema (`"pass | fail"`) or any other value is NOT counted as a verdict.
+fn valid_verdict(v: &Value) -> Option<&str> {
+    match v.get("verdict").and_then(Value::as_str) {
+        Some(s) if s == "pass" || s == "fail" => Some(s),
+        _ => None,
+    }
+}
+
+/// Return the CONTENTS of every fenced code block whose info string is exactly
+/// `json` (case-insensitive), in document order. A block opens on a line whose
+/// trimmed text is ```` ```json ```` and closes on the next line whose trimmed
+/// text is ```` ``` ````. An unterminated final block yields the text to
+/// end-of-string (a truncated transcript should still surrender its verdict).
+fn fenced_json_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut lines = text.lines();
+    let mut current: Option<String> = None;
+    for line in lines.by_ref() {
+        let trimmed = line.trim();
+        match current {
+            None => {
+                // Opening fence: ```json (allow trailing spaces, any case for
+                // the language tag).
+                if let Some(rest) = trimmed.strip_prefix("```") {
+                    if rest.trim().eq_ignore_ascii_case("json") {
+                        current = Some(String::new());
+                    }
+                }
+            }
+            Some(ref mut buf) => {
+                if trimmed == "```" {
+                    blocks.push(std::mem::take(buf));
+                    current = None;
+                } else {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+            }
+        }
+    }
+    // An unterminated block (truncated output) still contributes its contents.
+    if let Some(buf) = current {
+        if !buf.trim().is_empty() {
+            blocks.push(buf);
+        }
+    }
+    blocks
+}
+
 /// Find the `input` of the first `tool_use` block named `name`, if present.
 fn find_tool_input(content: &[Value], name: &str) -> Option<Value> {
     content.iter().find_map(|block| {
@@ -1109,5 +1421,230 @@ mod tests {
         let text = user_message_text(&t);
         assert!(text.contains("Prior verifier reports"));
         assert!(text.contains("build broke"));
+    }
+
+    // ---- DrivenVerifier: build_verifier_prompt --------------------------------
+
+    #[test]
+    fn build_verifier_prompt_contains_evidence_and_json_instruction() {
+        let spec = spec_with_criteria(vec![
+            ac("AC1", "x is exported", CriterionKind::Invariant),
+            ac("AC2", "cargo build passes", CriterionKind::Command),
+        ]);
+        let t = task("claude-sonnet-4-6", spec);
+        let prompt = build_verifier_prompt(&t);
+
+        // Skeptical framing + read-only, no-edit stance.
+        assert!(prompt.contains("You did NOT write this code"));
+        assert!(prompt.contains("CANNOT edit"));
+        // The criteria are present.
+        assert!(prompt.contains("AC1"));
+        assert!(prompt.contains("AC2"));
+        // The diff + gate output are fenced into the prompt.
+        assert!(prompt.contains(&t.diff), "diff must be embedded");
+        assert!(prompt.contains(&t.gate_output), "gate output must be embedded");
+        // The JSON verdict instruction + inline schema fields.
+        assert!(prompt.contains("EXACTLY ONE fenced ```json"));
+        assert!(prompt.contains("NOTHING after"));
+        assert!(prompt.contains("\"verdict\""));
+        assert!(prompt.contains("\"findings\""));
+        assert!(prompt.contains("\"out_of_scope_diff\""));
+        assert!(prompt.contains("\"commands_run\""));
+        // The fail-requires-blocker rule is stated.
+        assert!(prompt.contains("REQUIRES at least one"));
+    }
+
+    #[test]
+    fn build_verifier_prompt_includes_prior_reports() {
+        let spec = spec_with_criteria(vec![ac("AC1", "cargo build", CriterionKind::Command)]);
+        let mut t = task("claude-sonnet-4-6", spec);
+        t.prior_reports.push(ReportBody {
+            verdict: Verdict::Fail,
+            findings: vec![Finding {
+                severity: Severity::Blocker,
+                criterion_id: Some("AC1".into()),
+                evidence: "prior blocker text".into(),
+            }],
+            out_of_scope_diff: false,
+            commands_run: Vec::new(),
+        });
+        let prompt = build_verifier_prompt(&t);
+        assert!(prompt.contains("Prior verifier reports"));
+        assert!(prompt.contains("prior blocker text"));
+    }
+
+    // ---- DrivenVerifier: parse_verdict_from_text (the fragile part) -----------
+
+    #[test]
+    fn parse_verdict_clean_pass() {
+        let text = "Here is my assessment.\n\n```json\n{\n  \"verdict\": \"pass\",\n  \
+                    \"findings\": [],\n  \"out_of_scope_diff\": false,\n  \"commands_run\": []\n}\n```";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+        assert!(report.findings.is_empty());
+        assert!(!report.out_of_scope_diff);
+        assert!(report.commands_run.is_empty());
+    }
+
+    #[test]
+    fn parse_verdict_fail_with_blocker() {
+        let text = "```json\n{\"verdict\":\"fail\",\"findings\":[\
+                    {\"severity\":\"blocker\",\"criterion_id\":\"AC1\",\"evidence\":\"missing fn\"}],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Fail);
+        let blockers = report
+            .findings
+            .iter()
+            .filter(|f| f.severity == Severity::Blocker)
+            .count();
+        assert_eq!(blockers, 1);
+        assert_eq!(report.findings[0].criterion_id.as_deref(), Some("AC1"));
+    }
+
+    #[test]
+    fn parse_verdict_fail_without_blocker_synthesizes_one() {
+        // A fail with only a `concern` must have a blocker synthesized (ADR-002).
+        let text = "```json\n{\"verdict\":\"fail\",\"findings\":[\
+                    {\"severity\":\"concern\",\"criterion_id\":\"AC1\",\"evidence\":\"weak\"}],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Fail);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.severity == Severity::Blocker),
+            "a blocker must be synthesized so a genuine fail survives the invariant"
+        );
+    }
+
+    #[test]
+    fn parse_verdict_trims_narrative_after_json() {
+        // Model emits the block then keeps talking; we still parse the block.
+        let text = "```json\n{\"verdict\":\"pass\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```\n\n\
+                    Note: I also noticed the tests are a bit thin, but the criteria are met.";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_schema_illustration_excluded() {
+        // A quoted schema block (`"verdict":"pass | fail"`) is NOT a valid verdict
+        // (verdict must be exactly "pass"/"fail"), so it is EXCLUDED; the one real
+        // verdict block is used. (No conflict → not ambiguous.)
+        let text = "First, the schema I will fill in:\n\
+                    ```json\n{\"verdict\":\"pass | fail\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```\n\n\
+                    Now my actual verdict:\n\
+                    ```json\n{\"verdict\":\"fail\",\"findings\":[\
+                    {\"severity\":\"blocker\",\"criterion_id\":\"AC1\",\"evidence\":\"regression\"}],\
+                    \"out_of_scope_diff\":true,\"commands_run\":[]}\n```";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Fail);
+        assert!(report.out_of_scope_diff);
+        assert_eq!(report.findings[0].evidence, "regression");
+    }
+
+    #[test]
+    fn parse_verdict_skips_non_verdict_json_block_before_real_one() {
+        // A ```json block WITHOUT a `verdict` key (e.g. the model echoing some
+        // other JSON) must be skipped; the real verdict block wins even though it
+        // comes first here — a non-verdict block never overrides it.
+        let text = "```json\n{\"verdict\":\"pass\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```\n\n\
+                    Supporting data:\n```json\n{\"note\":\"some other object\"}\n```";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_invalid_json_is_protocol_error() {
+        let text = "```json\n{ this is not valid json at all }\n```";
+        let err = parse_verdict_from_text(text).unwrap_err();
+        assert!(matches!(err, ImplementerError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_verdict_no_block_is_protocol_error() {
+        let text = "I think this looks fine, verdict: pass. (no fenced block at all)";
+        let err = parse_verdict_from_text(text).unwrap_err();
+        assert!(matches!(err, ImplementerError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_verdict_unknown_severity_is_protocol_error() {
+        // `severity: "critical"` is not in the enum → serde rejects → Protocol.
+        let text = "```json\n{\"verdict\":\"fail\",\"findings\":[\
+                    {\"severity\":\"critical\",\"criterion_id\":\"AC1\",\"evidence\":\"x\"}],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```";
+        let err = parse_verdict_from_text(text).unwrap_err();
+        assert!(matches!(err, ImplementerError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_verdict_unknown_verdict_is_protocol_error() {
+        let text = "```json\n{\"verdict\":\"maybe\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```";
+        let err = parse_verdict_from_text(text).unwrap_err();
+        assert!(matches!(err, ImplementerError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_verdict_fenced_language_tag_case_insensitive() {
+        let text = "```JSON\n{\"verdict\":\"pass\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_unterminated_fence_still_parses() {
+        // A truncated transcript (no closing fence) should still surrender its
+        // verdict rather than being lost.
+        let text = "```json\n{\"verdict\":\"pass\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn parse_verdict_unfenced_object_is_rejected() {
+        // Adversarial review: a bare (unfenced) verdict object in prose must NOT
+        // be accepted — a worker could embed `{"verdict":"pass"}` in a source file
+        // the model then echoes. Only a fenced ```json block counts; else error.
+        let text = "My verdict is: {\"verdict\":\"pass\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]} — done.";
+        let err = parse_verdict_from_text(text).unwrap_err();
+        assert!(matches!(err, ImplementerError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_verdict_conflicting_blocks_are_ambiguous_not_pass() {
+        // Adversarial review (the reproduced spurious-PASS): the model emits its
+        // REAL fail verdict, then an illustrative pass EXAMPLE after it. This MUST
+        // be fail-closed (Protocol error) — never silently a PASS.
+        let text = "The function is unimplemented — a blocker.\n\
+                    ```json\n{\"verdict\":\"fail\",\"findings\":[\
+                    {\"severity\":\"blocker\",\"criterion_id\":\"AC1\",\"evidence\":\"unimplemented\"}],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```\n\n\
+                    For reference, a passing verdict would look like:\n\
+                    ```json\n{\"verdict\":\"pass\",\"findings\":[],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```";
+        let err = parse_verdict_from_text(text).unwrap_err();
+        assert!(matches!(err, ImplementerError::Protocol(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_verdict_object_with_braces_in_strings() {
+        // Evidence text containing braces must not confuse the brace matcher.
+        let text = "```json\n{\"verdict\":\"fail\",\"findings\":[\
+                    {\"severity\":\"blocker\",\"criterion_id\":null,\
+                    \"evidence\":\"code was `fn f() { todo!() }` — unimplemented\"}],\
+                    \"out_of_scope_diff\":false,\"commands_run\":[]}\n```";
+        let report = parse_verdict_from_text(text).unwrap();
+        assert_eq!(report.verdict, Verdict::Fail);
+        assert!(report.findings[0].evidence.contains("todo!()"));
     }
 }

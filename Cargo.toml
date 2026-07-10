@@ -11,6 +11,7 @@ repository = "local"
 [workspace.dependencies]
 # internal
 maestro-journal = { path = "crates/maestro-journal" }
+maestro-driver = { path = "crates/maestro-driver" }
 maestro-sandbox = { path = "crates/maestro-sandbox" }
 maestro-implementer = { path = "crates/maestro-implementer" }
 maestro-proxy = { path = "crates/maestro-proxy" }

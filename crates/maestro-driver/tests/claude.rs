@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maestro_driver::{
-    json_phase_args, pid_alive, run_claude_driven, DrivenConfig, EndReason, KillKind,
-    MockPlanChecker,
+    json_phase_args, pid_alive, run_claude_driven, run_claude_verify_readonly, DrivenConfig,
+    EndReason, KillKind, MockPlanChecker,
 };
 use maestro_journal::domain::Tier;
 use maestro_journal::spec::{AcceptanceCriterion, Budget, CriterionKind, TaskSpec};
@@ -112,6 +112,15 @@ case "${mode}" in
         emit_assistant "PLAN: eventually"
         emit_result 11 7 0.01 1
         exit 0
+        ;;
+      verify)
+        # READ-ONLY VERIFIER: a single plan-mode phase whose assistant text is a
+        # fenced ```json verdict block (the shape run_claude_verify_readonly
+        # captures). The assistant `text` value carries the fenced block with the
+        # inner double-quotes JSON-escaped (\") and newlines as \n, so the whole
+        # stream-json line is itself valid JSON. No edits; metering reported.
+        printf '{"type":"assistant","message":{"stop_reason":null,"content":[{"type":"text","text":"I reviewed the diff. Verdict:\\n\\n```json\\n{\\"verdict\\": \\"pass\\", \\"findings\\": [], \\"out_of_scope_diff\\": false, \\"commands_run\\": []}\\n```"}]}}\n'
+        emit_result 20 5 0.01 1
         ;;
       *)
         emit_assistant "PLAN: I will create the file as specified"
@@ -589,6 +598,50 @@ fn json_phase_args_includes_max_budget_usd_when_set() {
         Some("do the thing"),
         "prompt must remain the last argument"
     );
+}
+
+/// READ-ONLY VERIFIER PHASE: `run_claude_verify_readonly` runs a SINGLE
+/// `--permission-mode plan` phase (no execute phase, no plan checker) and returns
+/// the model's assistant text — here a fenced ```json verdict — plus metering.
+/// Confirms the verifier path reuses the plan-phase machinery and captures the
+/// verdict text the daemon-side `parse_verdict_from_text` then parses.
+#[test]
+fn verify_readonly_captures_assistant_verdict_text() {
+    let f = fixture();
+    let out = run_claude_verify_readonly(
+        "bash",
+        &[
+            f.cli.to_string_lossy().to_string(),
+            "verify".to_string(),
+            f.target.to_string_lossy().to_string(),
+        ],
+        "verify this diff",
+        &f.cwd,
+        &f.log,
+        Duration::from_secs(15),
+        Some(Duration::from_secs(30)),
+        &[],
+    );
+
+    assert_eq!(out.reason, EndReason::Completed, "log at {:?}", f.log);
+    // The assistant text carries the fenced verdict block.
+    assert!(
+        out.assistant_text.contains("```json"),
+        "assistant text must carry the fenced json verdict, got: {:?}",
+        out.assistant_text
+    );
+    assert!(
+        out.assistant_text.contains("\"verdict\": \"pass\""),
+        "verdict text captured, got: {:?}",
+        out.assistant_text
+    );
+    // Read-only: the verifier phase never runs an execute phase, so the target
+    // file the acceptEdits phase would write is absent.
+    assert!(!f.target.exists(), "read-only verify must make zero edits");
+    // Metering from the single plan-phase result event.
+    assert_eq!(out.tokens_in, Some(20));
+    assert_eq!(out.tokens_out, Some(5));
+    assert_eq!(out.turns, 1);
 }
 
 /// `json_phase_args` with `max_budget_usd = None` must NOT contain
