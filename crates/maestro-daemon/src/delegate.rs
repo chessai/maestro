@@ -25,8 +25,8 @@ use maestro_journal::report::{ReportBody, Verdict};
 use maestro_journal::spec::{CriterionKind, TaskSpec};
 use maestro_journal::Journal;
 use maestro_implementer::{
-    AnthropicBackend, AnthropicVerifier, ImplementerBackend, ImplementerError, ImplementerTask,
-    MockBackend, MockVerifier, VerifierBackend, VerifyTask,
+    AnthropicBackend, AnthropicVerifier, DrivenVerifier, ImplementerBackend, ImplementerError,
+    ImplementerTask, MockBackend, MockVerifier, VerifierBackend, VerifyTask,
 };
 use maestro_driver::{
     AnthropicPlanChecker, DrivenConfig, DrivenSession, EndReason, KillKind, MockPlanChecker,
@@ -572,16 +572,33 @@ fn verifier_role_is_mock(role: &ResolvedRole) -> bool {
     role.model == "mock" || role.kind.as_deref() == Some("mock")
 }
 
-/// Select the verifier backend for a resolved verifier role: `mock` → the
-/// deterministic [`MockVerifier`], else the [`AnthropicVerifier`] built with
-/// `effective_base_url` (the proxy address when the proxy is enabled and this is
-/// a non-mock verifier — see `run_verifier` — else the role's own base_url).
+/// Select the verifier backend for a resolved verifier role:
+/// - `mock` → the deterministic [`MockVerifier`];
+/// - a `driven_cli` role → the [`DrivenVerifier`], which drives the local
+///   subscription `claude` CLI read-only (no API credits) in the throwaway
+///   checkout (`driven_cwd`, severed `.git`);
+/// - else → the [`AnthropicVerifier`] built with `effective_base_url` (the proxy
+///   address when the proxy is enabled and this is a non-mock verifier — see
+///   `run_verifier` — else the role's own base_url).
 fn select_verifier_backend(
     role: &ResolvedRole,
     effective_base_url: Option<String>,
+    driven_cwd: Option<PathBuf>,
 ) -> Box<dyn VerifierBackend> {
     if verifier_role_is_mock(role) {
         Box::new(MockVerifier)
+    } else if role.kind.as_deref() == Some("driven_cli") {
+        // Drive the subscription CLI read-only. `command`/`args` come from the
+        // role; the CLI runs in the throwaway checkout. It is subscription-backed
+        // (unmetered), so strip provider API keys (no `--max-budget-usd` billing).
+        let program = role.command.clone().unwrap_or_else(|| "claude".to_string());
+        let args = role.args.clone().unwrap_or_default();
+        Box::new(DrivenVerifier::new(
+            program,
+            args,
+            driven_cwd,
+            driven_env_remove(None),
+        ))
     } else {
         Box::new(AnthropicVerifier::new(effective_base_url))
     }
@@ -2204,15 +2221,25 @@ fn run_verifier(
         }
         _ => (verifier_role.base_url.clone(), None),
     };
-    let backend = select_verifier_backend(&verifier_role, verifier_base_url);
-
     // The verifier MAY run bounded commands in a THROWAWAY COPY of the
     // implementer's worktree, severed from the repo (ADR-002). Built here (lazily
     // copied on first use); dropped — and its tempdir removed — when this
     // function returns. The MockVerifier ignores it; the AnthropicVerifier drives
     // it via the `run_command` tool and the daemon's records populate
-    // `commands_run`.
+    // `commands_run`; the DrivenVerifier runs the CLI with this checkout as its
+    // read-only cwd.
     let runner = ThrowawayCheckoutRunner::new(worktree_path, recipe.clone());
+
+    // For a `driven_cli` verifier, materialize the throwaway checkout eagerly so
+    // the CLI can be given it as its cwd (severed `.git`, so its inspection is
+    // read-only structurally). Only built for that backend to avoid a needless
+    // copy on the mock / API paths.
+    let driven_cwd = if verifier_role.kind.as_deref() == Some("driven_cli") {
+        runner.prepared_checkout_dir()
+    } else {
+        None
+    };
+    let backend = select_verifier_backend(&verifier_role, verifier_base_url, driven_cwd);
 
     // Up to two tries: a crash / invalid report retries once with a fresh
     // session (ADR-002).

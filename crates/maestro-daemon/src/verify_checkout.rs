@@ -61,6 +61,14 @@ impl ThrowawayCheckoutRunner {
         }
     }
 
+    /// Eagerly materialize the throwaway checkout and return its directory, or
+    /// `None` if the copy failed. Public so the driven verifier can run the CLI
+    /// with the same severed-`.git` checkout as its cwd (the CLI inspects files
+    /// there read-only). Idempotent (the copy is cached).
+    pub fn prepared_checkout_dir(&self) -> Option<PathBuf> {
+        self.checkout_dir().ok()
+    }
+
     /// Return the throwaway-checkout directory, creating it on first use. On a
     /// copy failure returns the error string (cached; not retried).
     fn checkout_dir(&self) -> Result<PathBuf, String> {
