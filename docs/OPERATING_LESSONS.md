@@ -160,6 +160,71 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   `XDG_CACHE_HOME`) via `.env_remove()` on the check command. Keep gate commands
   hermetic by construction.
 
+### L15. Fix-in-place retry on `checks_failed` — preserve near-complete work — FIXED
+- **Observed:** when an attempt failed at the mechanical GATE (`checks_failed` —
+  a build/clippy/test `check_command` returned non-zero), the retry cut a FRESH
+  worktree off `base_ref` and re-implemented the whole task from scratch,
+  discarding the worker's near-complete code. Hit live: a theseus-syntax task
+  whose parser compiled down to a single trivial borrow error (`use of moved
+  value`) needed 3+ full ~15-min re-implementations, each throwing away working
+  code and rewriting everything only to hit a *different* trivial compile error.
+- **Impact:** for a near-complete implementation, "rewrite everything" is the
+  wrong retry strategy — enormous wasted wall-clock/turns, and the retry can
+  regress from an almost-passing state to a differently-broken one.
+- **Incorporation:** LANDED. When an attempt's terminal outcome is a
+  `checks_failed`, the pipeline now carries a `CheckFailure { command,
+  output_digest }` into the NEXT same-tier attempt (new field on
+  `AttemptOutcome::VerificationFailed { check_failure }`; set only on the gate's
+  `ChecksFailed` arm, `None` for a model `verify_failed`). On that next attempt:
+  1. **Reuse the same worktree** — `run_attempt` / `run_driven_attempt` skip
+     `worktree::create` (which resets to `base_ref`) and reuse the existing
+     worktree with the worker's edits intact, guarded by `worktree::reuse`
+     (`is_live_worktree`: the dir exists AND `git rev-parse
+     --is-inside-work-tree` succeeds; a missing/pruned worktree falls back to a
+     fresh cut, so reuse is always safe).
+  2. **Inject the failing check into the worker's context** — `check_fix_preamble`
+     prepends a "Fix the failing check — do NOT rewrite" block (the failing
+     command + its captured output + "your edits are ALREADY PRESENT, make the
+     SMALLEST change") to the one-shot backend's `house_rules` and to the driven
+     CLI's prompt, so the worker fixes the specific error instead of rewriting.
+  3. **Escalation ladder preserved** — the tier-bump logic is unchanged; only the
+     worktree-reset behavior changes. On escalation the carryover is DROPPED
+     (`pending_check_fix = None`): a bigger model starts on a fresh worktree with
+     the prior verifier reports + last diff (ADR-003). Fix-in-place is strictly a
+     SAME-TIER retry optimization.
+- **Failure-kind boundary (chosen decision table).** Reuse the worktree ONLY when
+  the worker produced a coherent, near-complete diff that merely tripped a check;
+  everything else may have junk/out-of-bounds/partial edits, so a fresh worktree
+  is the safe default:
+
+  | terminal outcome of the attempt | next attempt's worktree | why |
+  |---|---|---|
+  | `checks_failed` (build/clippy/test check returned non-zero) | **REUSE** + inject failing check | edits are near-complete; a targeted fix beats a rewrite |
+  | `verify_failed` (model verifier rejected the approach) | fresh cut | the verifier rejected the *approach*, not a mechanical slip; re-implement with the report as context |
+  | `scope_violation` / `TightenedScopeExceeded` | fresh cut (terminal anyway) | worker ignored the allowlist → out-of-bounds edits; doesn't earn reuse (ADR-003: terminal, not fuel) |
+  | `session_wedged` / `turn_budget_exceeded` / `interrupted_*` (kill) / `plan_rejected` | fresh cut (terminal anyway) | worker didn't finish cleanly → possibly partial/junk edits |
+  | escalation to a higher tier | fresh cut (carryover dropped) | a bigger model re-approaches from base; reuse is same-tier only |
+
+- **Tests:** `worktree::is_live_worktree_true_for_live_false_for_absent_or_removed`
+  (the reuse guard), `delegate::check_fix_preamble_names_command_output_and_says_do_not_rewrite`
+  (the injected context), and the end-to-end
+  `tests/fix_in_place.rs::m_l15_checks_failed_retry_reuses_worktree_and_fixes_in_place`:
+  a check command that creates an in-allowlist marker + exits non-zero on its
+  first run and passes once the marker exists — the marker only survives into
+  attempt 2 if the worktree was reused, so `verify_passed` after exactly ONE
+  `checks_failed` with NO `escalated` proves fix-in-place. The existing
+  `verify_escalation` test still proves the `verify_failed` fresh-restart ladder
+  is unchanged.
+- **Follow-ups (not in this pass):** (a) the reused worktree's stale in-allowlist
+  artifacts from attempt 1 persist (e.g. a marker/scratch file the worker wrote)
+  — benign here (the gate re-diffs against the pinned base each attempt), but a
+  worker that writes a broken file it later abandons keeps that file; consider a
+  `git checkout -- .`-to-clean-untracked-but-keep-tracked policy if this bites.
+  (b) fix-in-place currently reuses for BOTH same-tier `checks_failed` retries;
+  it is intentionally NOT applied across an escalation — if we later want the
+  escalated model to *see* the smaller model's near-complete worktree (rather
+  than re-cut), that's a deliberate ADR-003 amendment, not a silent change.
+
 ---
 
 ## Advisor / spec authoring
