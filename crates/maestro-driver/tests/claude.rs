@@ -102,6 +102,17 @@ case "${mode}" in
         emit_exit_plan "ExitPlanMode" "PLAN: create the target file as specified"
         emit_result 11 7 0.01 3
         ;;
+      planslow)
+        # A plan phase that emits some output (so the IDLE watchdog is reset and
+        # would NOT fire) and then runs long — exercising the L4 wall-clock
+        # ceiling, which must trip on absolute elapsed time regardless of output.
+        emit_init
+        emit_thinking
+        sleep 3000
+        emit_assistant "PLAN: eventually"
+        emit_result 11 7 0.01 1
+        exit 0
+        ;;
       *)
         emit_assistant "PLAN: I will create the file as specified"
         emit_result 11 7 0.01 1
@@ -232,6 +243,22 @@ fn config(f: &Fixture, scenario: &str, watchdog: Duration, turn_cap: Option<u32>
         env_remove: vec![],
         turn_cap,
         max_budget_usd: None,
+        // Default: no plan-phase wall-clock ceiling. The L4 test sets it via
+        // `config_with_plan_ceiling`.
+        plan_ceiling: None,
+    }
+}
+
+/// Like [`config`] but with an explicit plan-phase wall-clock ceiling (L4).
+fn config_with_plan_ceiling(
+    f: &Fixture,
+    scenario: &str,
+    watchdog: Duration,
+    plan_ceiling: Duration,
+) -> DrivenConfig {
+    DrivenConfig {
+        plan_ceiling: Some(plan_ceiling),
+        ..config(f, scenario, watchdog, None)
     }
 }
 
@@ -383,6 +410,50 @@ fn turn_cap_hard_stops_execute_phase() {
             assert!(
                 Instant::now() < deadline,
                 "child pid {pid} still alive after turn-cap teardown"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// L4: the plan phase is turn-uncapped, so a plan that keeps emitting output
+/// (resetting the IDLE watchdog) but runs long must still be bounded. With a
+/// short plan-phase wall-clock ceiling and a LONG idle watchdog, the ceiling
+/// trips FIRST — the plan phase is torn down and mapped to PlanRejected (terminal,
+/// ZERO edits: no execute phase runs). Without the ceiling this would run until
+/// the (long) watchdog or forever.
+#[test]
+fn plan_phase_wall_clock_ceiling_tears_down_a_long_plan() {
+    let f = fixture();
+    // Short plan ceiling (1s) but a long idle watchdog (60s): the "planslow"
+    // scenario emits output then sleeps, so only the wall-clock ceiling can fire.
+    let cfg = config_with_plan_ceiling(
+        &f,
+        "planslow",
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let (handle, join) = run_claude_driven(cfg, spec(), Arc::new(MockPlanChecker)).unwrap();
+
+    let result = join.join().unwrap();
+    match result.reason {
+        EndReason::PlanRejected { reason } => {
+            assert!(
+                reason.contains("wall-clock"),
+                "plan-ceiling teardown names the cause, got: {reason}"
+            );
+        }
+        other => panic!("expected PlanRejected from the plan-phase ceiling, got {other:?}; log at {:?}", f.log),
+    }
+    // ZERO edits: the execute phase never ran, so the target is absent.
+    assert!(!f.target.exists(), "no edits: execute phase must not run");
+    // No lingering child (the plan-phase child was torn down).
+    if let Some(pid) = handle.pid() {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while pid_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "child pid {pid} still alive after plan-ceiling teardown"
             );
             std::thread::sleep(Duration::from_millis(50));
         }

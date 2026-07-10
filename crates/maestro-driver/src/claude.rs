@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use maestro_journal::spec::TaskSpec;
 
@@ -94,6 +94,11 @@ enum JsonPhaseKind {
     Exited(Option<i32>),
     /// The execute phase exceeded the turn cap and was torn down mid-session.
     TurnCapExceeded,
+    /// The phase exceeded its wall-clock ceiling and was torn down mid-session
+    /// (operating-lesson L4). Distinct from `Wedged` (idle watchdog): this fires
+    /// even when the phase is actively emitting output. Only the plan phase sets a
+    /// wall-clock ceiling today; the execute phase is turn-capped instead.
+    WallClockExceeded,
     /// No output past the watchdog → wedged (child torn down).
     Wedged,
     /// External kill request honored (child torn down).
@@ -144,6 +149,8 @@ pub fn run_claude_driven(
             &log_path,
             config.watchdog,
             None,
+            // L4: the plan phase is turn-uncapped; bound it by wall-clock instead.
+            config.plan_ceiling,
             config.max_budget_usd,
             &kill_rx,
             &pid_slot,
@@ -159,6 +166,19 @@ pub fn run_claude_driven(
             }
             JsonPhaseKind::Wedged => {
                 return result(EndReason::Wedged, log_path, p1.turns(), &p1);
+            }
+            JsonPhaseKind::WallClockExceeded => {
+                // L4: the plan phase ran past its wall-clock ceiling. Terminal,
+                // ZERO edits (no execute phase) — mapped to PlanRejected so the
+                // daemon's existing plan-rejected path handles it (not fuel).
+                return result(
+                    EndReason::PlanRejected {
+                        reason: "plan phase exceeded its wall-clock ceiling".into(),
+                    },
+                    log_path,
+                    p1.turns(),
+                    &p1,
+                );
             }
             JsonPhaseKind::TurnCapExceeded => {
                 // No cap is set for the plan phase, so this cannot occur; treat
@@ -210,6 +230,8 @@ pub fn run_claude_driven(
                     &log_path,
                     config.watchdog,
                     config.turn_cap,
+                    // The execute phase is turn-capped, not wall-clock-capped.
+                    None,
                     config.max_budget_usd,
                     &kill_rx,
                     &pid_slot,
@@ -223,6 +245,9 @@ pub fn run_claude_driven(
                         EndReason::Failed(format!("claude execute phase exited non-zero: {code:?}"))
                     }
                     JsonPhaseKind::TurnCapExceeded => EndReason::TurnBudgetExceeded,
+                    // Not reachable (execute passes `None` for wall_clock), but keep
+                    // the match exhaustive and fail safe if that ever changes.
+                    JsonPhaseKind::WallClockExceeded => EndReason::TurnBudgetExceeded,
                     JsonPhaseKind::Killed(kind) => EndReason::Killed(kind),
                     JsonPhaseKind::Wedged => EndReason::Wedged,
                     JsonPhaseKind::SpawnError(e) => EndReason::Failed(e),
@@ -330,6 +355,10 @@ fn run_json_phase(
     log_path: &Path,
     watchdog: Duration,
     turn_cap: Option<u32>,
+    // Wall-clock ceiling for THIS phase (operating-lesson L4): if the phase runs
+    // longer than this since spawn — regardless of activity — it is torn down and
+    // `JsonPhaseKind::WallClockExceeded` is returned. `None` = no ceiling.
+    wall_clock: Option<Duration>,
     max_budget_usd: Option<f64>,
     kill_rx: &Receiver<KillKind>,
     pid_slot: &Arc<Mutex<Option<i32>>>,
@@ -353,10 +382,21 @@ fn run_json_phase(
 
     let mut state = ParseState::default();
     let mut cursor = 0usize; // byte offset into the shared buffer already parsed.
+    let started = Instant::now();
 
     let kind = loop {
         // Parse any newly-buffered complete lines (updates state + cursor).
         parse_new_lines(&pty, &mut cursor, &mut state);
+
+        // Wall-clock ceiling (L4): bound the phase even when it is actively
+        // emitting output (so the idle watchdog never fires). Checked first so a
+        // runaway phase is reaped promptly.
+        if let Some(ceiling) = wall_clock {
+            if started.elapsed() > ceiling {
+                pty.teardown();
+                break JsonPhaseKind::WallClockExceeded;
+            }
+        }
 
         // Turn-cap enforcement (execute phase only): the observed assistant-turn
         // count EXCEEDING the cap hard-stops the phase mid-session.

@@ -115,6 +115,15 @@ pub struct DrivenConfig {
     /// ceiling. `None` → subscription mode (keys stripped by the daemon).
     /// The generic [`DrivenSession`] path ignores this field.
     pub max_budget_usd: Option<f64>,
+    /// Wall-clock ceiling on the PLAN phase of the structured `claude` adapter
+    /// (operating-lesson L4). The execute phase is turn-capped, but the plan
+    /// phase is otherwise uncapped: an active-but-looping plan (one that keeps
+    /// emitting output, so the idle watchdog never fires) could run unbounded.
+    /// When set, the plan phase is torn down after this much elapsed wall-clock
+    /// and mapped to [`EndReason::PlanRejected`] (terminal, zero edits). `None`
+    /// = no plan-phase wall-clock ceiling. The generic [`DrivenSession`] path
+    /// ignores this field; it applies only to the two-phase `claude` adapter.
+    pub plan_ceiling: Option<Duration>,
 }
 
 /// Bound on plan-echo lines read after the marker line.

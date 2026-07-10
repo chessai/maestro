@@ -1456,6 +1456,25 @@ fn watchdog_duration(rp: &ResolvedProfile) -> Duration {
     Duration::from_secs(u64::from(rp.watchdog_minutes.max(1)) * 60)
 }
 
+/// The PLAN-PHASE wall-clock ceiling for the structured `claude` adapter
+/// (operating-lesson L4). The plan phase is turn-uncapped and only covered by the
+/// IDLE watchdog, so an active-but-looping plan (one that keeps emitting output)
+/// could run unbounded. This bounds it by absolute wall-clock, independent of
+/// activity. Overridable by `MAESTRO_PLAN_CEILING_SECONDS` (tests set a short
+/// value); otherwise a generous multiple of the watchdog — a plan may span a few
+/// active turns but should never approach the task-lifetime ceiling — with a
+/// 5-minute floor.
+fn plan_ceiling_duration(rp: &ResolvedProfile) -> Duration {
+    if let Ok(secs) = std::env::var("MAESTRO_PLAN_CEILING_SECONDS") {
+        if let Ok(secs) = secs.trim().parse::<u64>() {
+            return Duration::from_secs(secs.max(1));
+        }
+    }
+    let watchdog = watchdog_duration(rp);
+    // 5× the watchdog, floored at 5 minutes.
+    (watchdog * 5).max(Duration::from_secs(5 * 60))
+}
+
 /// Build the task prompt handed to a driven CLI over the PTY (ADR-003 plan-echo):
 /// title + instructions + allowlist, then the plan-echo instruction.
 fn driven_prompt(spec: &TaskSpec) -> String {
@@ -1608,6 +1627,9 @@ fn run_driven_attempt(
     let turn_cap = effective_turn_cap(rp, recipe, role, spec);
 
     let watchdog = watchdog_duration(rp);
+    // L4: bound the (turn-uncapped) plan phase by wall-clock. Only the structured
+    // `claude` adapter reads it; the generic path ignores it.
+    let plan_ceiling = plan_ceiling_duration(rp);
 
     // API-billed: when max_budget_usd is set, keep provider API keys so the
     // CLI can authenticate per-token and self-enforce the cap. Subscription
@@ -1633,6 +1655,8 @@ fn run_driven_attempt(
         plan_timeout: watchdog,
         turn_cap: Some(turn_cap),
         max_budget_usd: role.max_budget_usd,
+        // L4: plan-phase wall-clock ceiling (structured `claude` adapter only).
+        plan_ceiling: Some(plan_ceiling),
         // Strip provider API keys for subscription-authenticated CLIs (flat-
         // rate, unmetered). When max_budget_usd is set the role is API-billed
         // (pay-per-token): retain the keys so the CLI can authenticate and
