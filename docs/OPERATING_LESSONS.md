@@ -370,3 +370,41 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   re-runnable after reset — not a harness fault.
 - **Incorporation:** none needed; document so operators don't mistake external
   quota for a bug.
+
+---
+
+## Advisor discipline (orchestration)
+
+### L17. The advisor must ACTIVELY monitor — a >5 min stall it doesn't notice is an advisor failure
+- **Observed:** an "overnight autonomous" run made ZERO progress across ~6 hours.
+  A task `blocked` ~5 minutes in (a 2-line compile error), and nothing detected
+  it, re-ran it, or launched the next wave. Two compounding root causes:
+  1. **The advisor was passive, not active.** It drove its "loop" with
+     `ScheduleWakeup` *outside* a `/loop` session — which schedules a wake-up but
+     never actually re-invokes the advisor. So after the initial setup the advisor
+     simply never ran again; it only ever acted when the human prompted it. Every
+     "I'll check back in N seconds" was hollow — no wake-up ever fired.
+  2. **The task was launched at the TOP tier** (tier 2), which has no
+     `checks_failed` retry/escalation budget → one trivial gate failure →
+     immediate `blocked`. A passive advisor never noticed to re-run it.
+- **Impact:** the orchestrator is the load-bearing part of maestro. A passive
+  advisor turns a 2-line fix into 6 wasted hours. **Work stalled for 5+ minutes
+  with no advisor action means the advisor is not doing its job.**
+- **Incorporation (rules):**
+  1. **Active monitoring is the advisor's core duty.** While ANY task is in
+     flight, poll its state at least every ~5 minutes AND check liveness (worker
+     log timestamp advancing? worktree files growing? trace kinds progressing?).
+     No state change and no log activity for >5 min = a suspected stall —
+     investigate (`maestro logs`) and act (kill / re-delegate) now, don't wait.
+  2. **Unattended runs need a mechanism that REALLY re-invokes the advisor** — a
+     genuine `/loop`, or a cron (`CronCreate`) that fires the poll procedure on a
+     schedule. `ScheduleWakeup` only fires inside a `/loop` runtime; fire-and-forget
+     outside `/loop` is a no-op. ALWAYS verify the FIRST wake-up actually
+     re-invokes you before trusting a loop to run unattended — if it doesn't fire,
+     the whole "autonomous" run is dead on arrival.
+  3. **Don't start a task at the top tier when you want resilience.** The top tier
+     has no `checks_failed` retry/escalation budget, so one trivial gate failure
+     (a lint, a wrong variant name) → `blocked`. Start at tier 0 (fix-in-place
+     retries + escalation up to the top); pin the top tier only for genuinely
+     one-shot work.
+- Reflected in the `maestro-advisor` skill (§Monitoring discipline).

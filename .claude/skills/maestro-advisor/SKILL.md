@@ -95,6 +95,31 @@ verify failed — respec/decompose/ask the human, then `close-task`), `failed`
 (carries one taxonomy kind — see `reference.md`). A `failed` with an external
 quota/rate-limit reason is **not a bug**; it's re-runnable after reset.
 
+### Monitoring discipline — the advisor's core duty (L17)
+
+You are an **orchestrator**, not a fire-and-forgetter. Delegating a task is the
+start of your job, not the end.
+
+- **While any task is in flight, check it at least every ~5 minutes** — state
+  (`task-status`), progression (`--query trace`), AND liveness (`maestro logs
+  <TASK>` — is the worker's last log timestamp advancing? are worktree files
+  growing?). A task with no state change and no log activity for **>5 minutes** is
+  a suspected stall: investigate and act (`kill` + re-delegate) — do NOT wait for
+  it to resolve itself. Work stalled 5+ min that you didn't notice = you failed.
+- **A `blocked`/`failed` task does not un-block itself.** The moment you see one,
+  read the failure and act (re-delegate the same spec — fix-in-place usually
+  converges; respec; or record it for the human). Leaving a task `blocked` while
+  you assume "it's working" is the classic advisor failure.
+- **Unattended runs need a mechanism that actually RE-INVOKES you** — a real
+  `/loop`, or a cron (`CronCreate`) firing your poll procedure on a schedule.
+  `ScheduleWakeup` fires ONLY inside a `/loop` runtime; used outside `/loop` it
+  schedules nothing that runs — your "loop" is dead and you won't know. **Verify
+  the first wake-up actually re-invokes you before trusting any unattended loop.**
+- **Start resilient work at tier 0, not the top tier.** The top tier has no
+  `checks_failed` retry/escalation budget — one trivial gate error (a lint, a
+  wrong enum-variant name) → immediate `blocked`. Tier 0 gets fix-in-place retries
+  and escalates upward on its own.
+
 ## 4. Writing a TaskSpec (the exact schema)
 
 The spec is immutable JSON. Full field-by-field schema and a complete worked
