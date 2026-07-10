@@ -211,6 +211,47 @@ impl Credentials {
     }
 }
 
+/// Stall auto-recovery action (ADR-009 Phase 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallAction {
+    /// Snapshot the diff, kill the stalled session, and re-attempt same-tier
+    /// (fix-in-place if edits were committed, else fresh). Default.
+    #[default]
+    SnapshotKillRetry,
+    /// Emit the `stall_detected` event and leave the task for the advisor /
+    /// the coarse watchdog. No automatic kill or retry.
+    FlagOnly,
+}
+
+/// Daemon-side liveness monitoring config (ADR-009 Phase 2). Controls stall
+/// detection + auto-recovery for driven sessions. TOML shape:
+/// `monitoring.stall_timeout_seconds = 300`, `monitoring.stall_action = "snapshot_kill_retry"`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    /// Seconds of zero PTY output (AND no journal state transition) before
+    /// flagging a driven session as `suspected_stall`. Must be LESS than the
+    /// coarse `watchdog_minutes` (the outer backstop). Default 300 (5 min).
+    #[serde(default = "default_stall_timeout")]
+    pub stall_timeout_seconds: u64,
+    /// What to do on a detected stall. Default `snapshot_kill_retry`.
+    #[serde(default)]
+    pub stall_action: StallAction,
+}
+
+fn default_stall_timeout() -> u64 {
+    300
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        MonitoringConfig {
+            stall_timeout_seconds: default_stall_timeout(),
+            stall_action: StallAction::default(),
+        }
+    }
+}
+
 /// The `[defaults]` table (ADR-007). Every knob has a value here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Defaults {
@@ -232,6 +273,8 @@ pub struct Defaults {
     pub containment: ContainmentConfig,
     #[serde(default)]
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
 }
 
 fn default_watchdog() -> u32 {
@@ -250,6 +293,7 @@ impl Default for Defaults {
             advisor: AdvisorConfig::default(),
             containment: ContainmentConfig::default(),
             proxy: ProxyConfig::default(),
+            monitoring: MonitoringConfig::default(),
         }
     }
 }
@@ -432,6 +476,8 @@ pub struct Profile {
     pub shim: Option<ShimConfig>,
     #[serde(default)]
     pub watchdog_minutes: Option<u32>,
+    #[serde(default)]
+    pub monitoring: Option<MonitoringConfig>,
 }
 
 #[cfg(test)]

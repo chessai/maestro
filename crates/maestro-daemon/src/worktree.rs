@@ -410,6 +410,31 @@ pub fn snapshot_diff(worktree: &Path, base_ref: &str) -> String {
     }
 }
 
+/// Best-effort list of changed files in the worktree that match the file
+/// allowlist globs. Used by stall-recovery (ADR-009 Phase 2) to commit only
+/// in-scope edits before a retry. Returns an empty vec on any error.
+pub fn changed_in_allowlist(worktree: &Path, base_ref: &str, allowlist: &[String]) -> Vec<String> {
+    let Ok(changed) = changed_files(worktree, base_ref) else {
+        return Vec::new();
+    };
+    if allowlist.is_empty() {
+        return changed;
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pat in allowlist {
+        if let Ok(g) = globset::Glob::new(pat) {
+            builder.add(g);
+        }
+    }
+    let Ok(set) = builder.build() else {
+        return changed;
+    };
+    changed
+        .into_iter()
+        .filter(|path| set.is_match(path))
+        .collect()
+}
+
 /// The result of a successful [`merge_task_branch`]: the base branch now
 /// includes the task branch, via a fast-forward or a 3-way merge commit, and
 /// points at `merged_sha`.

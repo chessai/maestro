@@ -120,6 +120,14 @@ pub enum EventKind {
     /// payload: failure kind, optional `superseded_by` task_id.
     Failed,
     Pruned,
+    /// Daemon-side stall detection fired (ADR-009 Phase 2): the driven session
+    /// produced no PTY output for longer than `stall_timeout_seconds`.
+    /// payload: `idle_seconds`, `stall_timeout_seconds`, `partial_diff`.
+    StallDetected,
+    /// Daemon auto-recovered from a detected stall (ADR-009 Phase 2): the stalled
+    /// session was killed and a retry attempt was launched.
+    /// payload: `action` (snapshot_kill_retry | flag_only), `has_edits`.
+    AutoRecovered,
 }
 
 impl EventKind {
@@ -146,6 +154,8 @@ impl EventKind {
             EventKind::Interrupted => "interrupted",
             EventKind::Failed => "failed",
             EventKind::Pruned => "pruned",
+            EventKind::StallDetected => "stall_detected",
+            EventKind::AutoRecovered => "auto_recovered",
         }
     }
 
@@ -172,6 +182,8 @@ impl EventKind {
             "interrupted" => EventKind::Interrupted,
             "failed" => EventKind::Failed,
             "pruned" => EventKind::Pruned,
+            "stall_detected" => EventKind::StallDetected,
+            "auto_recovered" => EventKind::AutoRecovered,
             _ => return None,
         })
     }

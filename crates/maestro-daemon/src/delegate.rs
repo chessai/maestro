@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use maestro_journal::config::{Config, RoleModel};
+use maestro_journal::config::{Config, RoleModel, StallAction};
 use maestro_journal::domain::{
     ContainmentLevel, EventKind, ExitStatus, Independence, Role, SessionKind, Tier,
 };
@@ -1122,6 +1122,10 @@ enum AttemptOutcome {
     },
     /// Terminal, NOT escalation fuel: scope violation (already journaled).
     ScopeViolation,
+    /// The driven session was stalled and auto-recovered (ADR-009 Phase 2).
+    /// NOT escalation fuel — the daemon retries same-tier. `has_edits` tells the
+    /// pipeline whether to fix-in-place (reuse worktree) or start fresh.
+    StallRecovered { has_edits: bool },
 }
 
 /// The escalation control loop (ADR-003). Runs implementer→gate→verify attempts,
@@ -1203,6 +1207,12 @@ fn run_pipeline(
     // specific error instead of rewriting. Cleared after each attempt consumes
     // it; only ever set from a `checks_failed` outcome (never verify_failed).
     let mut pending_check_fix: Option<CheckFailure> = None;
+    // ADR-009 Phase 2: bound stall auto-recoveries so a permanently-stalling
+    // worker cannot be killed+retried forever (adversarial review). After the
+    // cap the task is blocked for the advisor rather than looping to the coarse
+    // wall-clock ceiling.
+    let mut stall_retries = 0u32;
+    const MAX_STALL_RETRIES: u32 = 3;
 
     loop {
         // BEFORE each attempt: enforce the lifetime ceilings (ADR-003). A task
@@ -1235,6 +1245,45 @@ fn run_pipeline(
         match outcome {
             AttemptOutcome::Passed => return Ok(()),
             AttemptOutcome::ScopeViolation => return Ok(()),
+            AttemptOutcome::StallRecovered { has_edits } => {
+                // Bound auto-recoveries (adversarial review): a worker that keeps
+                // stalling must not be killed+retried forever. After the cap,
+                // block for the advisor instead of looping to the wall-clock ceiling.
+                stall_retries += 1;
+                if stall_retries > MAX_STALL_RETRIES {
+                    let blocked_payload = serde_json::json!({
+                        "reason": "stall_recovery_exhausted",
+                        "stall_recoveries": stall_retries - 1,
+                        "partial_diff": last_failed_diff.as_deref().map(cap_diff),
+                    })
+                    .to_string();
+                    emit(state, task_id, EventKind::Blocked, Some(&blocked_payload));
+                    return Ok(());
+                }
+                // ADR-009 Phase 2: the daemon killed a stalled driven session and
+                // is retrying same-tier. NOT escalation fuel — does NOT increment
+                // `tier_failures`. If the worker had edits, set up fix-in-place
+                // with a synthetic CheckFailure so the next attempt reuses the
+                // worktree. If no edits, next attempt cuts a fresh worktree.
+                let action_payload = serde_json::json!({
+                    "action": "snapshot_kill_retry",
+                    "has_edits": has_edits,
+                })
+                .to_string();
+                emit(state, task_id, EventKind::AutoRecovered, Some(&action_payload));
+                if has_edits {
+                    pending_check_fix = Some(CheckFailure {
+                        command: "(stall detected — session killed by daemon)".to_string(),
+                        output_digest: "The driven session produced no output past the stall \
+                                        timeout. Your previous edits are already present in \
+                                        this worktree. Continue from where you left off."
+                            .to_string(),
+                    });
+                } else {
+                    pending_check_fix = None;
+                }
+                // Same-tier retry: loop continues without incrementing tier_failures.
+            }
             AttemptOutcome::VerificationFailed { diff, report, check_failure } => {
                 // AFTER a failed attempt: the implementer + verifier sessions
                 // have written their metered tokens, so the accumulated total is
@@ -1552,6 +1601,31 @@ fn watchdog_duration(rp: &ResolvedProfile) -> Duration {
     Duration::from_secs(u64::from(rp.watchdog_minutes.max(1)) * 60)
 }
 
+/// The stall-detection timeout for a driven session (ADR-009 Phase 2).
+/// Overridable by `MAESTRO_STALL_TIMEOUT_SECONDS` (integration tests set a
+/// short value). Returns `None` when stall detection is disabled (timeout = 0).
+fn stall_timeout_duration(rp: &ResolvedProfile) -> Option<Duration> {
+    let secs = if let Ok(env) = std::env::var("MAESTRO_STALL_TIMEOUT_SECONDS") {
+        env.trim().parse::<u64>().unwrap_or(rp.monitoring.stall_timeout_seconds)
+    } else {
+        rp.monitoring.stall_timeout_seconds
+    };
+    if secs == 0 {
+        return None;
+    }
+    // S1 (adversarial review): stall detection must fire BEFORE the coarse
+    // watchdog, else the watchdog wins the race and the task fails as
+    // `session_wedged` instead of auto-recovering — silently defeating the
+    // feature. Clamp the stall timeout to stay below the watchdog.
+    let watchdog_secs = (rp.watchdog_minutes as u64).saturating_mul(60);
+    let secs = if watchdog_secs > 30 {
+        secs.min(watchdog_secs - 30)
+    } else {
+        secs
+    };
+    Some(Duration::from_secs(secs.max(1)))
+}
+
 /// The PLAN-PHASE wall-clock ceiling for the structured `claude` adapter
 /// (operating-lesson L4). The plan phase is turn-uncapped and only covered by the
 /// IDLE watchdog, so an active-but-looping plan (one that keeps emitting output)
@@ -1802,9 +1876,53 @@ fn run_driven_attempt(
         }
     };
 
-    // Register the live session for the break-glass kill path, then join.
-    state.register_session(task_id, handle);
-    let result = join.join();
+    // Register the live session for the break-glass kill path.
+    state.register_session(task_id, handle.clone());
+
+    // --- Stall-monitoring join (ADR-009 Phase 2) ---
+    // Instead of a blocking `join.join()`, poll for completion while checking
+    // liveness. If the driven session goes silent for longer than `stall_timeout`
+    // AND the stall_action is `snapshot_kill_retry`, kill the session and let the
+    // pipeline retry. A `flag_only` action emits the event and waits for the
+    // coarse watchdog (inside the driver) to handle it.
+    let stall_timeout = stall_timeout_duration(rp);
+    let stall_action = rp.monitoring.stall_action;
+    let mut stall_flagged = false;
+
+    let result = loop {
+        if join.is_finished() {
+            break join.join();
+        }
+        // Check for a stall: PTY output silent for longer than `stall_timeout`.
+        if let Some(timeout) = stall_timeout {
+            let idle = handle.idle();
+            if idle > timeout && !stall_flagged {
+                let partial_diff = cap_diff(&worktree::snapshot_diff(&worktree_path, scope_base));
+                let stall_payload = serde_json::json!({
+                    "idle_seconds": idle.as_secs(),
+                    "stall_timeout_seconds": timeout.as_secs(),
+                    "partial_diff": partial_diff,
+                })
+                .to_string();
+                emit(state, task_id, EventKind::StallDetected, Some(&stall_payload));
+                tracing::warn!(
+                    task = %task_id,
+                    idle_secs = idle.as_secs(),
+                    timeout_secs = timeout.as_secs(),
+                    "stall detected: driven session produced no output past stall_timeout"
+                );
+                stall_flagged = true;
+
+                if stall_action == StallAction::SnapshotKillRetry {
+                    // Kill the stalled session; the join will resolve shortly.
+                    handle.request_kill(KillKind::Stall);
+                    break join.join();
+                }
+                // flag_only: event emitted, let the coarse watchdog handle the rest.
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
     state.unregister_session(task_id);
 
     let result = match result {
@@ -1926,6 +2044,43 @@ fn run_driven_attempt(
             worktree::remove(repo, &worktree_path);
             Ok(AttemptOutcome::ScopeViolation)
         }
+        EndReason::Killed(KillKind::Stall) => {
+            // Stall auto-recovery (ADR-009 Phase 2): the daemon killed this
+            // session because it detected no output past `stall_timeout`. Instead
+            // of terminally failing, return `StallRecovered` so the pipeline
+            // retries same-tier (fix-in-place if edits exist, else fresh).
+            finish_session(
+                state,
+                session_id.as_deref(),
+                ExitStatus::Killed,
+                turns,
+                tokens_in,
+                tokens_out,
+            );
+            // Check whether the worker committed any edits (or has uncommitted
+            // changes in the worktree). A non-empty diff = edits worth saving.
+            let diff = worktree::snapshot_diff(&worktree_path, scope_base);
+            let has_edits = !diff.trim().is_empty();
+            if has_edits {
+                // Commit the partial edits so they survive a `git reset --hard HEAD`
+                // on the retry (same pattern as L15b checks_failed durability).
+                let changed = worktree::changed_in_allowlist(&worktree_path, scope_base, &spec.file_allowlist);
+                if !changed.is_empty() {
+                    if let Err(e) = worktree::commit_paths(
+                        &worktree_path,
+                        &changed,
+                        &format!("maestro: stall-recovery checkpoint — {}", spec.title),
+                    ) {
+                        tracing::warn!(
+                            task = task_id,
+                            error = %e,
+                            "stall recovery: committing in-allowlist edits failed"
+                        );
+                    }
+                }
+            }
+            Ok(AttemptOutcome::StallRecovered { has_edits })
+        }
         EndReason::Killed(kind) => {
             let partial_diff = snapshot();
             finish_session(
@@ -1939,6 +2094,8 @@ fn run_driven_attempt(
             let (fail_kind, kind_label) = match kind {
                 KillKind::Human => ("interrupted_human", "human"),
                 KillKind::Advisor => ("interrupted_advisor", "advisor"),
+                // Stall handled above; this arm covers future variants defensively.
+                KillKind::Stall => ("interrupted_stall", "stall"),
             };
             // First the `interrupted` event (payload: reason=kill + snapshot),
             // then the terminal `failed(interrupted_*)` (ADR-006).
