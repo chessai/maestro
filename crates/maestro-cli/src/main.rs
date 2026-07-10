@@ -7,6 +7,7 @@ mod advise;
 mod client;
 mod daemon;
 mod init;
+mod progress;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -66,6 +67,38 @@ enum Command {
         /// Optional derived-state filter (e.g. `checks_passed`, `failed`).
         #[arg(long)]
         state: Option<String>,
+    },
+    /// One-shot situational digest of an advisor's tasks (ADR-009): per-task
+    /// state/tier/age + a needs-attention marker, grouped counts, an ACTIONABLE
+    /// section, and a one-line summary. Always exits 0 (it is a report).
+    Status {
+        /// Advisor session id (from `maestro delegate`).
+        #[arg(long)]
+        advisor: String,
+        /// Optionally scope the digest to a single task id.
+        #[arg(long)]
+        task: Option<String>,
+    },
+    /// Block until a tracked task needs advisor attention (ADR-009): polls
+    /// `task-status` and exits 0 the moment any tracked task is actionable
+    /// (`verify_passed`/`blocked`/`failed`), or all tracked tasks are terminal.
+    /// Run it in the background so the harness re-invokes the advisor exactly
+    /// when a decision is due.
+    Watch {
+        /// Advisor session id (from `maestro delegate`).
+        #[arg(long)]
+        advisor: String,
+        /// Task id(s) to track. Repeatable. Default: all of the advisor's tasks
+        /// that are non-terminal at the first poll.
+        #[arg(long = "task")]
+        tasks: Vec<String>,
+        /// Poll interval in seconds (default 5).
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+        /// Optional backstop: give up after this many seconds and exit non-zero
+        /// (code 2). Off by default (block indefinitely).
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Close a `blocked` task, recording its outcome (ADR-003).
     CloseTask {
@@ -163,6 +196,13 @@ fn real_main() -> Result<()> {
         Command::TaskStatus { advisor, state } => {
             cmd_task_status(profile, &advisor, state.as_deref())
         }
+        Command::Status { advisor, task } => cmd_status(profile, &advisor, task.as_deref()),
+        Command::Watch {
+            advisor,
+            tasks,
+            interval,
+            timeout,
+        } => cmd_watch(profile, &advisor, &tasks, interval, timeout),
         Command::CloseTask {
             advisor,
             task,
@@ -397,6 +437,46 @@ fn cmd_task_status(profile: Option<&str>, advisor: &str, state: Option<&str>) ->
         }
         Response::Error { message } => bail!("daemon error on task-status: {message}"),
         other => bail!("unexpected response to TaskStatus: {other:?}"),
+    }
+}
+
+/// `maestro status --advisor <id> [--task <id>]`: a one-shot situational digest
+/// (ADR-009 component C). Always exits 0 — it is a report. Reuses the read-side
+/// `Request::TaskStatus`; all formatting lives in `progress::render_status`.
+fn cmd_status(profile: Option<&str>, advisor: &str, task: Option<&str>) -> Result<()> {
+    let mut send = |req: &Request| ensured_request(profile, req);
+    progress::run_status(&mut send, advisor, task)
+}
+
+/// `maestro watch --advisor <id> [--task <id>]... [--interval <s>] [--timeout <s>]`:
+/// block until a tracked task needs advisor attention (ADR-009 component B).
+/// Exits 0 when a tracked task is actionable or all tracked tasks are terminal;
+/// exits 2 if the optional `--timeout` backstop fires. Client-side poll loop over
+/// `Request::TaskStatus` — no daemon protocol/control-flow change.
+fn cmd_watch(
+    profile: Option<&str>,
+    advisor: &str,
+    tasks: &[String],
+    interval: u64,
+    timeout: Option<u64>,
+) -> Result<()> {
+    let mut send = |req: &Request| ensured_request(profile, req);
+    let mut sleep = |d: std::time::Duration| std::thread::sleep(d);
+    let mut now = std::time::Instant::now;
+    let outcome = progress::run_watch(
+        &mut send,
+        &mut sleep,
+        &mut now,
+        advisor,
+        tasks,
+        std::time::Duration::from_secs(interval.max(1)),
+        timeout.map(std::time::Duration::from_secs),
+    )?;
+    match outcome {
+        progress::WatchOutcome::Returned => Ok(()),
+        // A backstop timeout is a distinct, non-error exit code (2) so a caller
+        // can tell "decision due" (0) from "gave up waiting" (2).
+        progress::WatchOutcome::TimedOut => std::process::exit(2),
     }
 }
 

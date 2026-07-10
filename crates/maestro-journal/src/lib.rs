@@ -15,6 +15,7 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod paths;
+pub mod progress;
 pub mod proto;
 pub mod report;
 pub mod schema;
