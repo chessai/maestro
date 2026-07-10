@@ -34,6 +34,8 @@ pub enum KillKind {
     Human,
     /// Advisor `kill_task`.
     Advisor,
+    /// Daemon-side stall detection auto-recovery (ADR-009 Phase 2).
+    Stall,
 }
 
 /// Why a driven session ended.
@@ -137,6 +139,10 @@ pub struct SessionHandle {
     kill_tx: Sender<KillKind>,
     kill_sent: Arc<AtomicBool>,
     pid: Arc<Mutex<Option<i32>>>,
+    /// Mirrored last-output timestamp from the PTY reader (ADR-009 Phase 2).
+    /// Updated by the session/phase supervision loop; read by the daemon for
+    /// stall detection. Initialized to `Instant::now()` at handle creation.
+    idle_slot: Arc<Mutex<Instant>>,
 }
 
 impl SessionHandle {
@@ -159,6 +165,15 @@ impl SessionHandle {
     pub fn pid(&self) -> Option<i32> {
         *self.pid.lock().unwrap()
     }
+
+    /// How long since the PTY last produced output (ADR-009 Phase 2 liveness
+    /// signal). Mirrors the PTY reader's `last_output_at` — the same signal the
+    /// coarse `watchdog_minutes` uses inside the session, but readable from
+    /// outside (the daemon) for finer stall detection. Returns `Duration::ZERO`
+    /// if the slot has not been updated yet (the session just spawned).
+    pub fn idle(&self) -> Duration {
+        self.idle_slot.lock().unwrap().elapsed()
+    }
 }
 
 /// The pieces the daemon needs to register and later kill a driven session, plus
@@ -168,6 +183,7 @@ pub(crate) struct HandleWiring {
     pub(crate) handle: SessionHandle,
     pub(crate) kill_rx: Receiver<KillKind>,
     pub(crate) pid_slot: Arc<Mutex<Option<i32>>>,
+    pub(crate) idle_slot: Arc<Mutex<Instant>>,
 }
 
 impl HandleWiring {
@@ -175,15 +191,18 @@ impl HandleWiring {
         let (kill_tx, kill_rx) = mpsc::channel::<KillKind>();
         let kill_sent = Arc::new(AtomicBool::new(false));
         let pid_slot: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let idle_slot: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
         let handle = SessionHandle {
             kill_tx,
             kill_sent,
             pid: pid_slot.clone(),
+            idle_slot: idle_slot.clone(),
         };
         HandleWiring {
             handle,
             kill_rx,
             pid_slot,
+            idle_slot,
         }
     }
 }
@@ -208,7 +227,8 @@ impl DrivenSession {
         let kill_rx = wiring.kill_rx;
         let pid_slot = wiring.pid_slot;
 
-        let join = std::thread::spawn(move || run_session(config, spec, checker, kill_rx, pid_slot));
+        let idle_slot = wiring.idle_slot;
+        let join = std::thread::spawn(move || run_session(config, spec, checker, kill_rx, pid_slot, idle_slot));
 
         Ok((handle, join))
     }
@@ -221,6 +241,7 @@ fn run_session(
     checker: Arc<dyn PlanChecker + Send + Sync>,
     kill_rx: Receiver<KillKind>,
     pid_slot: Arc<Mutex<Option<i32>>>,
+    idle_slot: Arc<Mutex<Instant>>,
 ) -> DrivenResult {
     let log_path = config.log_path.clone();
 
@@ -239,7 +260,7 @@ fn run_session(
 
     // Drive the state machine; compute (reason, turns) then let `pty` drop
     // (which reaps the child, closes the master, and joins the reader).
-    let (reason, turns) = drive(&config, &spec, checker.as_ref(), &kill_rx, &mut pty);
+    let (reason, turns) = drive(&config, &spec, checker.as_ref(), &kill_rx, &mut pty, &idle_slot);
 
     DrivenResult {
         reason,
@@ -260,9 +281,10 @@ fn drive(
     checker: &dyn PlanChecker,
     kill_rx: &Receiver<KillKind>,
     pty: &mut PtyChild,
+    idle_slot: &Arc<Mutex<Instant>>,
 ) -> (EndReason, u32) {
     // ---- Plan-echo gate: block until the plan echo or plan_timeout/kill. ----
-    match wait_for_plan(&pty.shared, config, kill_rx, pty.child.as_mut()) {
+    match wait_for_plan(&pty.shared, config, kill_rx, pty.child.as_mut(), idle_slot) {
         PlanWait::Plan(plan) => match checker.check(&plan, spec) {
             PlanVerdict::Reject { reason } => {
                 pty.teardown();
@@ -270,7 +292,7 @@ fn drive(
             }
             PlanVerdict::Accept => {
                 // ---- Run to completion under watchdog + kill supervision. ----
-                (supervise(config, kill_rx, pty), 1)
+                (supervise(config, kill_rx, pty, idle_slot), 1)
             }
         },
         PlanWait::Killed(kind) => {
@@ -311,9 +333,13 @@ fn wait_for_plan(
     config: &DrivenConfig,
     kill_rx: &Receiver<KillKind>,
     child: &mut dyn portable_pty::Child,
+    idle_slot: &Arc<Mutex<Instant>>,
 ) -> PlanWait {
     let deadline = Instant::now() + config.plan_timeout;
     loop {
+        // Mirror the PTY's last-output timestamp to the external idle slot
+        // (ADR-009 Phase 2) so the daemon can observe liveness.
+        *idle_slot.lock().unwrap() = *shared.last_output_at.lock().unwrap();
         if let Ok(kind) = kill_rx.try_recv() {
             return PlanWait::Killed(kind);
         }
@@ -365,8 +391,15 @@ fn extract_plan(buf: &[u8], marker: &str) -> Option<String> {
 }
 
 /// Supervise the child until exit, watchdog, or kill.
-fn supervise(config: &DrivenConfig, kill_rx: &Receiver<KillKind>, pty: &mut PtyChild) -> EndReason {
+fn supervise(
+    config: &DrivenConfig,
+    kill_rx: &Receiver<KillKind>,
+    pty: &mut PtyChild,
+    idle_slot: &Arc<Mutex<Instant>>,
+) -> EndReason {
     loop {
+        // Mirror PTY liveness to the external idle slot (ADR-009 Phase 2).
+        *idle_slot.lock().unwrap() = *pty.shared.last_output_at.lock().unwrap();
         // (c) external kill.
         if let Ok(kind) = kill_rx.try_recv() {
             pty.teardown();

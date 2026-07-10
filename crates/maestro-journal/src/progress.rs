@@ -81,7 +81,9 @@ pub fn state_class(state: &str) -> StateClass {
         | EventKind::VerifyFailed
         | EventKind::Escalated
         | EventKind::Interrupted
-        | EventKind::Pruned => StateClass::Transient,
+        | EventKind::Pruned
+        | EventKind::StallDetected
+        | EventKind::AutoRecovered => StateClass::Transient,
     }
 }
 
@@ -240,6 +242,8 @@ mod tests {
             EventKind::Interrupted,
             EventKind::Failed,
             EventKind::Pruned,
+            EventKind::StallDetected,
+            EventKind::AutoRecovered,
         ];
 
         // Guard that ALL is exhaustive over the enum: every string round-trips

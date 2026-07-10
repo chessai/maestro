@@ -4,8 +4,8 @@
 
 use maestro_journal::config::{
     AdvisorConfig, Concurrency, Config, ContainmentConfig, ContainmentMin, Defaults,
-    DowngradePolicy, LifetimeFactors, Profile, ProxyConfig, Roles, SearchConfig, ShimConfig,
-    TightenFactors,
+    DowngradePolicy, LifetimeFactors, MonitoringConfig, Profile, ProxyConfig, Roles, SearchConfig,
+    ShimConfig, TightenFactors,
 };
 use serde::Serialize;
 
@@ -91,6 +91,8 @@ pub struct ResolvedProfile {
     /// Sourced from `[defaults].proxy`; there is no profile-level override in
     /// this pass. OPT-IN — `enabled` defaults to `false`.
     pub proxy: ProxyConfig,
+    /// Daemon-side liveness monitoring config (ADR-009 Phase 2).
+    pub monitoring: MonitoringConfig,
 }
 
 /// Overlay a profile's `advisor` table over the defaults' `advisor` table.
@@ -130,6 +132,7 @@ impl ResolvedProfile {
                 search: SearchConfig::default(),
                 codex_tighten: false,
                 proxy: defaults.proxy.clone(),
+                monitoring: defaults.monitoring.clone(),
             },
             Some(p) => ResolvedProfile {
                 concurrency: p.concurrency.unwrap_or(defaults.concurrency),
@@ -153,6 +156,10 @@ impl ResolvedProfile {
                 codex_tighten: p.codex_tighten.unwrap_or(false),
                 // No profile-level proxy override in this pass; inherit defaults.
                 proxy: defaults.proxy.clone(),
+                monitoring: p
+                    .monitoring
+                    .clone()
+                    .unwrap_or_else(|| defaults.monitoring.clone()),
             },
         }
     }

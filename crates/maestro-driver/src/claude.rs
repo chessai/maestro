@@ -141,6 +141,7 @@ pub fn run_claude_driven(
     let kill_rx = wiring.kill_rx;
     let pid_slot = wiring.pid_slot;
 
+    let idle_slot = wiring.idle_slot;
     let join = std::thread::spawn(move || {
         let log_path = config.log_path.clone();
 
@@ -160,6 +161,7 @@ pub fn run_claude_driven(
             &kill_rx,
             &pid_slot,
             &config.env_remove,
+            &idle_slot,
         );
         let p1 = plan_out.metering.clone();
 
@@ -241,6 +243,7 @@ pub fn run_claude_driven(
                     &kill_rx,
                     &pid_slot,
                     &config.env_remove,
+                    &idle_slot,
                 );
                 let p2 = &exec_out.metering;
 
@@ -331,6 +334,7 @@ pub fn run_claude_verify_readonly(
     // kept alive for the phase's duration; nothing ever sends on `_kill_tx`.
     let (_kill_tx, kill_rx) = std::sync::mpsc::channel::<KillKind>();
     let pid_slot: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+    let idle_slot: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
 
     let out = run_json_phase(
         program,
@@ -348,6 +352,7 @@ pub fn run_claude_verify_readonly(
         &kill_rx,
         &pid_slot,
         env_remove,
+        &idle_slot,
     );
 
     let m = &out.metering;
@@ -476,6 +481,8 @@ fn run_json_phase(
     kill_rx: &Receiver<KillKind>,
     pid_slot: &Arc<Mutex<Option<i32>>>,
     env_remove: &[String],
+    // ADR-009 Phase 2: mirrored last-output timestamp for daemon-side stall detection.
+    idle_slot: &Arc<Mutex<Instant>>,
 ) -> JsonPhaseOutcome {
     let args = json_phase_args(base_args, mode, prompt, max_budget_usd);
 
@@ -501,6 +508,8 @@ fn run_json_phase(
     let kind = loop {
         // Parse any newly-buffered complete lines (updates state + cursor).
         parse_new_lines(&pty, &mut cursor, &mut state);
+        // Mirror PTY liveness to the external idle slot (ADR-009 Phase 2).
+        *idle_slot.lock().unwrap() = *pty.shared.last_output_at.lock().unwrap();
 
         // Wall-clock ceiling (L4): bound the phase even when it is actively
         // emitting output (so the idle watchdog never fires). Checked first so a
