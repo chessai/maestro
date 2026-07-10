@@ -49,6 +49,15 @@ pub enum GateOutcome {
         command: String,
         /// A bounded digest of the command's combined output.
         output_digest: String,
+        /// The in-allowlist changed files, captured at the scope-check step —
+        /// BEFORE any check command ran, so it holds ONLY the implementer's clean
+        /// edits and never post-build artifacts (e.g. `target/`) a check command
+        /// may have created. The caller commits EXACTLY these paths to the task
+        /// branch so a same-tier fix-in-place retry (L15) resumes from a REAL
+        /// commit even if the reused worktree's working tree is later reset to
+        /// HEAD (the live loss-loop: uncommitted edits were wiped by the worker's
+        /// own `git reset` on the retry). Mirrors `Passed { changed }`.
+        changed: Vec<String>,
     },
 }
 
@@ -176,6 +185,10 @@ pub fn run(
             return Ok(GateOutcome::ChecksFailed {
                 command: cmd.clone(),
                 output_digest: digest,
+                // The in-allowlist edits captured before any check ran, so the
+                // caller can commit exactly these to the task branch (L15
+                // durability). Same set the `Passed` arm returns as `changed`.
+                changed: in_allowlist,
             });
         }
     }

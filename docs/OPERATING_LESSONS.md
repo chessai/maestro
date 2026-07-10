@@ -246,6 +246,43 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   escalated model to *see* the smaller model's near-complete worktree (rather
   than re-cut), that's a deliberate ADR-003 amendment, not a silent change.
 
+### L15b. Fix-in-place durability must NOT ride on the uncommitted working tree — FIXED
+- **Observed (live loss-loop, task `01KX5G3T90TPSJTVMJ6S8CDJDG`, repo theseus,
+  crate `theseus-check`):** L15 reused the worktree on a `checks_failed` but the
+  worker's edits were **never committed** — `commit_paths` ran ONLY on the
+  checks-PASSED path. The near-complete implementation (`testkit.rs` + every
+  module, one `clippy::manual_strip` fix from green) lived purely in the
+  uncommitted working tree. On the fix-in-place retry the driven worker's own
+  `git reset` (reflog: `reset: moving to HEAD`; HEAD still at base `b603cdb`)
+  wiped the working tree back to base — `git log --all` had NO commit with the
+  implementation. Unrecoverable: every `checks_failed` discarded the progress and
+  re-implemented from scratch — the exact loss L15 meant to prevent.
+- **Root cause:** the wipe was NOT maestro code (the only daemon `git reset` is the
+  `--mixed` index reset inside `commit_paths`, which never touches the working
+  tree). It was the **worker process** resetting a worktree whose edits maestro had
+  left uncommitted. Durability that depends on a fragile uncommitted working tree
+  loses to anything that resets it.
+- **Incorporation:** LANDED. On a `checks_failed`, `run_gate_and_verify` now
+  COMMITS the gate's in-allowlist `changed` set (captured before the check
+  commands ran, so no `target/`/artifacts) to the task branch via the SAME
+  `worktree::commit_paths` the pass path uses — BEFORE the attempt returns. The
+  same-tier retry then resumes from a REAL commit: a later `git reset --hard HEAD`
+  RESTORES the edits instead of discarding them. `GateOutcome::ChecksFailed` gained
+  a `changed: Vec<String>` field to carry that set. Escalation is unchanged —
+  `run_attempt` still cuts a FRESH worktree off `base_ref` (dropping the carryover
+  and force-deleting the task branch), so a fix-commit NEVER survives a tier bump;
+  only a same-tier `checks_failed` retry resumes from it (the decision table
+  holds). The best-effort commit logs-not-fails on error.
+- **Test:** `tests/fix_in_place_durability.rs::m_l15_checks_failed_edits_survive_a_worktree_reset_on_the_retry`
+  reproduces the real round-trip — attempt writes a file, trips a check
+  (`checks_failed`), and the reused retry does `git reset --hard HEAD` (the live
+  worker's cleanup) before checking the file is present. It FAILS against the
+  pre-fix code (`blocked`, the reset wiped the uncommitted edits) and PASSES after
+  (`verify_passed` after exactly one `checks_failed`, no escalation, and
+  `maestro/<task>:src/impl.rs` resolves — committed on the branch). Complements
+  L15's `fix_in_place.rs`, which only proved working-tree reuse under a benign mock
+  that never resets, and so missed this.
+
 ---
 
 ## Advisor / spec authoring

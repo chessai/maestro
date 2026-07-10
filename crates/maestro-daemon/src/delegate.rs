@@ -2072,6 +2072,7 @@ fn run_gate_and_verify(
         GateOutcome::ChecksFailed {
             command,
             output_digest,
+            changed,
         } => {
             let payload = serde_json::json!({
                 "command": command,
@@ -2079,12 +2080,46 @@ fn run_gate_and_verify(
             })
             .to_string();
             emit(state, task_id, EventKind::ChecksFailed, Some(&payload));
+            // DURABILITY (L15 / CLAUDE.md cautionary case): commit the worker's
+            // in-allowlist edits to the task branch NOW, before this attempt
+            // returns. A same-tier fix-in-place retry REUSES this worktree, and in
+            // the live loss-loop the worker's own `git reset` on that retry wiped
+            // the UNCOMMITTED near-complete edits back to base — unrecoverable.
+            // Committing here makes the retry resume from a REAL commit regardless
+            // of any later working-tree reset: `reset --hard HEAD` now RESTORES the
+            // edits instead of discarding them. We commit EXACTLY the gate's
+            // in-allowlist `changed` set (captured before the check commands ran,
+            // so never `target/` or other artifact/out-of-scope paths), via the
+            // same `commit_paths` the checks-PASSED path uses. Best-effort: a
+            // commit error is logged, not fatal.
+            //
+            // On ESCALATION the carryover is dropped and `run_attempt` cuts a FRESH
+            // worktree off `base_ref` (`worktree::create` force-deletes the task
+            // branch first), so this fix-commit never survives a tier bump — a
+            // bigger model always re-approaches from base (ADR-003 / decision
+            // table). Only a same-tier `checks_failed` retry resumes from it.
+            if let Err(e) = worktree::commit_paths(
+                worktree_path,
+                &changed,
+                &format!("maestro: fix-in-place checkpoint — {}", spec.title),
+            ) {
+                tracing::warn!(
+                    task = task_id,
+                    error = %e,
+                    "checks_failed: committing in-allowlist edits for fix-in-place durability failed"
+                );
+            }
             // Counts as a verification failure (ADR-003). No verifier ran, so no
             // report; carry the diff for the next attempt's context. AND carry the
             // failing command+output as a fix-in-place hint (L15): the next
-            // same-tier attempt reuses THIS worktree (edits intact) and injects
-            // this so the worker fixes the specific error instead of rewriting.
-            let diff = worktree::diff(worktree_path, scope_base).unwrap_or_default();
+            // same-tier attempt reuses THIS worktree (edits committed above) and
+            // injects this so the worker fixes the specific error, not rewrites.
+            //
+            // Scope the carried diff to the in-allowlist `changed` set (adversarial
+            // review, Finding 1): a plain `diff` here re-`add -A`s and would fold any
+            // artifacts a check command wrote into the escalation context. `diff_paths`
+            // keeps `last_failed_diff` artifact-free.
+            let diff = worktree::diff_paths(worktree_path, scope_base, &changed).unwrap_or_default();
             Ok(AttemptOutcome::VerificationFailed {
                 diff,
                 report: None,
