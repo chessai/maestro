@@ -767,6 +767,19 @@ pub fn delegate(
     // itself (branching off it is valid; it is simply not merge_task-able).
     let base_ref = worktree::resolve_base_ref(&repo, &spec.base_ref);
 
+    // Pin `base_ref` to the concrete commit SHA it points at NOW (operating-lesson
+    // L3). Every attempt's worktree is cut from this exact commit, and the
+    // scope/allowlist diff is taken against it — NOT the live `base_ref` tip. If a
+    // sibling task merges into `base_ref` while this task runs, the base branch
+    // advances but this task's scope check still diffs against the commit it was
+    // cut from, so the newly-merged files never appear as out-of-allowlist
+    // deletions → no spurious `scope_violation`. The MERGE TARGET stays the live
+    // symbolic `base_ref` (so `merge_task` can still fast-forward it); only the
+    // scope diff uses the pinned SHA. A ref that cannot be peeled to a commit
+    // (bogus / empty repo) leaves the pin absent → the pipeline falls back to the
+    // symbolic `base_ref`, preserving the prior behavior.
+    let pinned_base = worktree::resolve_to_sha(&repo, &base_ref);
+
     // The workspace path is fixed by convention: <state>/worktrees/<task_id>.
     // We do not know the task_id until create_task mints it, so record the row
     // first, then note the intended workspace via the worker.
@@ -793,7 +806,7 @@ pub fn delegate(
     let state = Arc::clone(state);
     let tid = task_id.clone();
     std::thread::spawn(move || {
-        run_worker(state, tid, repo, base_ref, spec, role, recipe);
+        run_worker(state, tid, repo, base_ref, pinned_base, spec, role, recipe);
     });
 
     Ok(task_id)
@@ -807,6 +820,7 @@ fn run_worker(
     task_id: String,
     repo: PathBuf,
     base_ref: String,
+    pinned_base: Option<String>,
     spec: TaskSpec,
     role: ResolvedRole,
     recipe: ContainmentRecipe,
@@ -871,7 +885,16 @@ fn run_worker(
     }
     let _slot = SlotGuard(&state);
 
-    if let Err(fail) = run_pipeline(&state, &task_id, &repo, &base_ref, &spec, &role, &recipe) {
+    if let Err(fail) = run_pipeline(
+        &state,
+        &task_id,
+        &repo,
+        &base_ref,
+        pinned_base.as_deref(),
+        &spec,
+        &role,
+        &recipe,
+    ) {
         // Any pipeline error is journaled as a terminal `failed`.
         let payload = failure_payload(fail.kind(), fail.message(), None);
         emit(&state, &task_id, EventKind::Failed, Some(&payload));
@@ -1008,10 +1031,18 @@ fn run_pipeline(
     task_id: &str,
     repo: &Path,
     base_ref: &str,
+    pinned_base: Option<&str>,
     spec: &TaskSpec,
     initial_role: &ResolvedRole,
     recipe: &ContainmentRecipe,
 ) -> Result<(), WorkerFailure> {
+    // The commit-ish every attempt cuts its worktree from AND diffs against for
+    // the scope/allowlist check (operating-lesson L3). Prefer the pinned SHA (the
+    // concrete commit `base_ref` pointed at when the task spawned); fall back to
+    // the symbolic `base_ref` when pinning was not possible. Distinct from the
+    // MERGE target (`base_ref`), which stays the live ref so `merge_task` can
+    // fast-forward it.
+    let scope_base = pinned_base.unwrap_or(base_ref);
     // Resolve the profile once for verifier selection + the escalation ladder.
     let rp = resolved_profile(state.profile_flag.as_deref())
         .map_err(|e| fail("internal_error", format!("resolving profile: {e}")))?;
@@ -1073,7 +1104,7 @@ fn run_pipeline(
             state,
             task_id,
             repo,
-            base_ref,
+            scope_base,
             spec,
             &role,
             attempt,
@@ -1161,7 +1192,10 @@ fn run_attempt(
     state: &DelegationState,
     task_id: &str,
     repo: &Path,
-    base_ref: &str,
+    // The pinned base commit-ish (operating-lesson L3): every worktree is cut
+    // from this exact commit and the scope/verifier diff is taken against it, so
+    // the base branch advancing mid-task cannot cause a spurious scope violation.
+    scope_base: &str,
     spec: &TaskSpec,
     role: &ResolvedRole,
     attempt: i64,
@@ -1179,7 +1213,7 @@ fn run_attempt(
             state,
             task_id,
             repo,
-            base_ref,
+            scope_base,
             spec,
             role,
             attempt,
@@ -1211,8 +1245,8 @@ fn run_attempt(
             fail("model_unavailable", e.message_public().to_string())
         })?;
 
-    // --- create a FRESH worktree per attempt off base_ref ---------------
-    let worktree_path = worktree::create(repo, base_ref, task_id)
+    // --- create a FRESH worktree per attempt off the PINNED base (L3) ----
+    let worktree_path = worktree::create(repo, scope_base, task_id)
         .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
 
     let workspace = worktree_path.to_string_lossy().to_string();
@@ -1332,7 +1366,7 @@ fn run_attempt(
     run_gate_and_verify(
         state,
         task_id,
-        base_ref,
+        scope_base,
         spec,
         role,
         attempt,
@@ -1428,7 +1462,9 @@ fn run_driven_attempt(
     state: &DelegationState,
     task_id: &str,
     repo: &Path,
-    base_ref: &str,
+    // The pinned base commit-ish (operating-lesson L3): the worktree is cut from
+    // it and every diff (gate, verifier, forensic snapshot) is taken against it.
+    scope_base: &str,
     spec: &TaskSpec,
     role: &ResolvedRole,
     attempt: i64,
@@ -1451,8 +1487,8 @@ fn run_driven_attempt(
         })?;
     let args = role.args.clone().unwrap_or_default();
 
-    // --- fresh worktree per attempt off base_ref (the CLI edits it) -----
-    let worktree_path = worktree::create(repo, base_ref, task_id)
+    // --- fresh worktree per attempt off the PINNED base (L3; CLI edits it) --
+    let worktree_path = worktree::create(repo, scope_base, task_id)
         .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
     let workspace = worktree_path.to_string_lossy().to_string();
 
@@ -1583,8 +1619,9 @@ fn run_driven_attempt(
         tracing::info!(task = %task_id, attempt, cost_usd = cost, "driven session reported cost");
     }
 
-    // A capped partial-diff snapshot for kill/wedge forensics (ADR-006).
-    let snapshot = || cap_diff(&worktree::snapshot_diff(&worktree_path, base_ref));
+    // A capped partial-diff snapshot for kill/wedge forensics (ADR-006). Taken
+    // against the pinned base (L3) — the commit the worktree was cut from.
+    let snapshot = || cap_diff(&worktree::snapshot_diff(&worktree_path, scope_base));
 
     match result.reason {
         EndReason::Completed => {
@@ -1602,7 +1639,7 @@ fn run_driven_attempt(
             run_gate_and_verify(
                 state,
                 task_id,
-                base_ref,
+                scope_base,
                 spec,
                 role,
                 attempt,
@@ -1752,7 +1789,12 @@ fn cap_diff(diff: &str) -> String {
 fn run_gate_and_verify(
     state: &DelegationState,
     task_id: &str,
-    base_ref: &str,
+    // The pinned base commit-ish (operating-lesson L3): the scope/allowlist diff,
+    // the checks-failed diff, and the verifier's structural diff are ALL taken
+    // against this exact commit — the one the worktree was cut from — never the
+    // live `base_ref` tip. This makes the scope check immune to the base branch
+    // advancing while the task runs.
+    scope_base: &str,
     spec: &TaskSpec,
     role: &ResolvedRole,
     attempt: i64,
@@ -1775,7 +1817,7 @@ fn run_gate_and_verify(
     emit(state, task_id, EventKind::ChecksStarted, None);
     let gate_outcome = gate::run(
         worktree_path,
-        base_ref,
+        scope_base,
         &spec.file_allowlist,
         max_changed_files,
         &spec.check_commands,
@@ -1827,7 +1869,7 @@ fn run_gate_and_verify(
             emit(state, task_id, EventKind::ChecksFailed, Some(&payload));
             // Counts as a verification failure (ADR-003). No verifier ran, so no
             // report; carry the diff for the next attempt's context.
-            let diff = worktree::diff(worktree_path, base_ref).unwrap_or_default();
+            let diff = worktree::diff(worktree_path, scope_base).unwrap_or_default();
             Ok(AttemptOutcome::VerificationFailed { diff, report: None })
         }
         GateOutcome::Passed { changed } => {
@@ -1840,7 +1882,7 @@ fn run_gate_and_verify(
             // (e.g. `target/`) that a check command created out of the diff even
             // when the repo has no `.gitignore` — a plain `add -A` diff would
             // otherwise stage them.
-            let diff = worktree::diff_paths(worktree_path, base_ref, &changed)
+            let diff = worktree::diff_paths(worktree_path, scope_base, &changed)
                 .map_err(|e| fail("internal_error", format!("diff for verifier: {e}")))?;
 
             let report = run_verifier(
