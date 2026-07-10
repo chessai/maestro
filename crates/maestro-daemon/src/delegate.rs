@@ -1071,6 +1071,21 @@ fn budget_exhausted(
     false
 }
 
+/// The mechanical GATE's `checks_failed` details, carried into the NEXT attempt
+/// so it can FIX-IN-PLACE instead of re-implementing from scratch (L15). When a
+/// `checks_failed` is the terminal outcome of an attempt, the pipeline keeps the
+/// worker's near-complete edits in the SAME worktree and injects this failing
+/// command + its captured output into the next attempt's worker context, so the
+/// worker fixes the specific error (e.g. a single trivial borrow-check error)
+/// rather than rewriting everything and hitting a *different* trivial error.
+#[derive(Debug, Clone)]
+struct CheckFailure {
+    /// The failing `check_command` (the first one the gate rejected).
+    command: String,
+    /// A bounded digest of that command's combined stdout+stderr.
+    output_digest: String,
+}
+
 /// The outcome of one implementer+gate+verify attempt, as it feeds the
 /// escalation control loop.
 enum AttemptOutcome {
@@ -1078,9 +1093,15 @@ enum AttemptOutcome {
     Passed,
     /// A verification failure (checks_failed OR verify_failed) — escalation fuel.
     /// Carries the failed diff + report (if a verifier ran) for the next attempt.
+    /// `check_failure` is `Some` ONLY when the mechanical gate's `check_commands`
+    /// rejected the edits (a `checks_failed`, no verifier ran): the next attempt
+    /// then REUSES this worktree (worker edits intact) and injects the failing
+    /// command+output so the worker fixes-in-place rather than rewriting (L15).
+    /// It is `None` for a model `verify_failed` (fresh worktree next attempt).
     VerificationFailed {
         diff: String,
         report: Option<ReportBody>,
+        check_failure: Option<CheckFailure>,
     },
     /// Terminal, NOT escalation fuel: scope violation (already journaled).
     ScopeViolation,
@@ -1157,6 +1178,14 @@ fn run_pipeline(
     // attempts (never transcripts) (ADR-002 / ADR-003).
     let mut prior_reports: Vec<ReportBody> = Vec::new();
     let mut last_failed_diff: Option<String> = None;
+    // FIX-IN-PLACE carryover (L15): when the previous attempt failed the
+    // mechanical gate's `check_commands` (a `checks_failed`), this holds the
+    // failing command + its output. When `Some`, the NEXT `run_attempt` REUSES
+    // the previous worktree (worker edits intact, no reset to base_ref) and
+    // injects the failing check into the worker's context so it fixes the
+    // specific error instead of rewriting. Cleared after each attempt consumes
+    // it; only ever set from a `checks_failed` outcome (never verify_failed).
+    let mut pending_check_fix: Option<CheckFailure> = None;
 
     loop {
         // BEFORE each attempt: enforce the lifetime ceilings (ADR-003). A task
@@ -1167,6 +1196,10 @@ fn run_pipeline(
         }
 
         attempt += 1;
+        // Consume any fix-in-place carryover from the prior attempt's
+        // `checks_failed` (L15): when present, `run_attempt` reuses the existing
+        // worktree and injects the failing check into the worker's context.
+        let check_fix = pending_check_fix.take();
         let outcome = run_attempt(
             state,
             task_id,
@@ -1179,12 +1212,13 @@ fn run_pipeline(
             recipe,
             &prior_reports,
             last_failed_diff.as_deref(),
+            check_fix.as_ref(),
         )?;
 
         match outcome {
             AttemptOutcome::Passed => return Ok(()),
             AttemptOutcome::ScopeViolation => return Ok(()),
-            AttemptOutcome::VerificationFailed { diff, report } => {
+            AttemptOutcome::VerificationFailed { diff, report, check_failure } => {
                 // AFTER a failed attempt: the implementer + verifier sessions
                 // have written their metered tokens, so the accumulated total is
                 // now current. If a ceiling is hit, stop terminally BEFORE
@@ -1199,6 +1233,19 @@ fn run_pipeline(
                     prior_reports.push(r);
                 }
                 last_failed_diff = Some(diff);
+                // FIX-IN-PLACE carryover (L15): a `checks_failed` (the mechanical
+                // gate's `check_commands` rejected the edits — `check_failure` is
+                // Some) means the worker's near-complete code is intact in the
+                // worktree and needs a targeted fix, not a rewrite. Carry the
+                // failing command+output so the NEXT attempt reuses that same
+                // worktree and injects it. A `verify_failed` (check_failure None)
+                // carries nothing → the next attempt gets a fresh worktree.
+                //
+                // When the loop is about to ESCALATE or STOP (blocked) this
+                // carryover is dropped below, because those paths reset the flow:
+                // an escalated (bigger) model or a blocked/abandoned task does not
+                // fix-in-place on the same worktree. Only a same-tier retry reuses.
+                pending_check_fix = check_failure;
 
                 if tier == top {
                     // One failure after reaching the top → blocked (resting).
@@ -1241,6 +1288,13 @@ fn run_pipeline(
                     tier = next;
                     role = next_role;
                     tier_failures = 0;
+                    // On escalation the fix-in-place carryover is DROPPED (L15):
+                    // the escalated (bigger) model starts on a FRESH worktree off
+                    // base_ref with the prior verifier reports + last failed diff
+                    // (ADR-003), not the smaller model's half-fixed worktree. Fix-
+                    // in-place is a SAME-TIER retry optimization; escalation resets
+                    // the approach.
+                    pending_check_fix = None;
                     // Budgets re-derive from the new tier; containment is never
                     // lowered (ADR-003) — M2 re-derives model here.
                 }
@@ -1270,6 +1324,12 @@ fn run_attempt(
     recipe: &ContainmentRecipe,
     prior_reports: &[ReportBody],
     last_failed_diff: Option<&str>,
+    // FIX-IN-PLACE carryover (L15): `Some` iff the PREVIOUS attempt failed the
+    // mechanical gate's `check_commands`. When set, this attempt REUSES the
+    // existing worktree (worker edits intact — no reset to base_ref) and injects
+    // the failing command + output into the worker's context so it fixes the
+    // specific error rather than re-implementing. `None` → fresh worktree.
+    check_fix: Option<&CheckFailure>,
 ) -> Result<AttemptOutcome, WorkerFailure> {
     let model = role.model.as_str();
 
@@ -1287,6 +1347,7 @@ fn run_attempt(
             rp,
             recipe,
             prior_reports,
+            check_fix,
         );
     }
 
@@ -1312,9 +1373,20 @@ fn run_attempt(
             fail("model_unavailable", e.message_public().to_string())
         })?;
 
-    // --- create a FRESH worktree per attempt off the PINNED base (L3) ----
-    let worktree_path = worktree::create(repo, scope_base, task_id)
-        .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
+    // --- worktree: fix-in-place REUSE vs fresh per-attempt cut (L15 / L3) ---
+    // Normally each attempt cuts a FRESH worktree off the PINNED base (L3),
+    // discarding the prior attempt's edits. But when the prior attempt failed the
+    // mechanical gate's `check_commands` (`check_fix` is Some), the worker's
+    // near-complete code is intact and needs a targeted fix, not a rewrite — so
+    // we REUSE the existing worktree (its edits preserved) rather than resetting
+    // to base_ref. A missing/absent worktree (e.g. the first attempt, or one that
+    // was torn down) falls back to a fresh cut, so this is always safe.
+    let worktree_path = if check_fix.is_some() && worktree::reuse(repo, task_id) {
+        worktree::worktree_path(task_id)
+    } else {
+        worktree::create(repo, scope_base, task_id)
+            .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?
+    };
 
     let workspace = worktree_path.to_string_lossy().to_string();
     emit(state, task_id, EventKind::Spawned, None);
@@ -1349,6 +1421,13 @@ fn run_attempt(
         }
         _ => String::new(),
     };
+    // FIX-IN-PLACE context injection (L15): when this attempt is reusing the
+    // prior attempt's worktree after a `checks_failed`, tell the worker its code
+    // is already present and it must FIX the specific failing check — not rewrite.
+    // Prepended AHEAD of any prior-verifier-report preamble; both may be present.
+    if let Some(cf) = check_fix {
+        house_rules = format!("{}{}", check_fix_preamble(cf), house_rules);
+    }
     if !prior_reports.is_empty() {
         // Prepend a summary of ALL prior reports + the last failed diff. Never
         // transcripts (ADR-002 / ADR-003).
@@ -1557,6 +1636,10 @@ fn run_driven_attempt(
     rp: &ResolvedProfile,
     recipe: &ContainmentRecipe,
     prior_reports: &[ReportBody],
+    // FIX-IN-PLACE carryover (L15): `Some` iff the PREVIOUS attempt failed the
+    // mechanical gate's `check_commands`. When set, reuse the existing worktree
+    // (CLI edits intact) and inject the failing check into the driven prompt.
+    check_fix: Option<&CheckFailure>,
 ) -> Result<AttemptOutcome, WorkerFailure> {
     let model = role.model.as_str();
 
@@ -1573,9 +1656,17 @@ fn run_driven_attempt(
         })?;
     let args = role.args.clone().unwrap_or_default();
 
-    // --- fresh worktree per attempt off the PINNED base (L3; CLI edits it) --
-    let worktree_path = worktree::create(repo, scope_base, task_id)
-        .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?;
+    // --- worktree: fix-in-place REUSE vs fresh per-attempt cut (L15 / L3) ---
+    // Normally cut a FRESH worktree off the PINNED base each attempt (L3). On a
+    // fix-in-place retry after a `checks_failed` (`check_fix` is Some) REUSE the
+    // existing worktree so the CLI's near-complete edits are intact; a missing
+    // worktree falls back to a fresh cut, so this is always safe.
+    let worktree_path = if check_fix.is_some() && worktree::reuse(repo, task_id) {
+        worktree::worktree_path(task_id)
+    } else {
+        worktree::create(repo, scope_base, task_id)
+            .map_err(|e| fail("internal_error", format!("worktree create: {e}")))?
+    };
     let workspace = worktree_path.to_string_lossy().to_string();
 
     // Wrap the driven CLI under the task's containment recipe (ADR-004): the CLI
@@ -1643,11 +1734,19 @@ fn run_driven_attempt(
         );
     }
 
+    // FIX-IN-PLACE context injection (L15): on a reuse after `checks_failed`,
+    // prepend the failing-check preamble to the driven prompt so the CLI fixes
+    // the specific error in its already-present edits rather than rewriting.
+    let prompt = match check_fix {
+        Some(cf) => format!("{}{}", check_fix_preamble(cf), driven_prompt(spec)),
+        None => driven_prompt(spec),
+    };
+
     let config = DrivenConfig {
         program,
         args,
         cwd: worktree_path.clone(),
-        prompt: driven_prompt(spec),
+        prompt,
         log_path: log_path.clone(),
         watchdog,
         plan_marker: "PLAN:".to_string(),
@@ -1859,6 +1958,28 @@ fn run_driven_attempt(
     }
 }
 
+/// Build the FIX-IN-PLACE preamble (L15) prepended to the worker's house rules
+/// when an attempt reuses the prior attempt's worktree after a `checks_failed`.
+/// It tells the worker (a) its previous edits are already present in the
+/// worktree, (b) which `check_command` failed, and (c) that it must make the
+/// SMALLEST targeted change to fix that specific error rather than rewriting.
+/// Pure given its input.
+fn check_fix_preamble(cf: &CheckFailure) -> String {
+    format!(
+        "## Fix the failing check — do NOT rewrite\n\
+         Your previous edits for this task ARE ALREADY PRESENT in this worktree. \
+         They compiled/ran far enough to reach the acceptance gate, but ONE check \
+         command failed. Do NOT start over or rewrite working code — read the \
+         error below and make the SMALLEST change that fixes exactly that error, \
+         then stop. Rewriting from scratch typically just trades this error for a \
+         different trivial one.\n\n\
+         ### Failing check command\n```\n{command}\n```\n\n\
+         ### Its output (stdout+stderr, truncated)\n```\n{output}\n```\n\n",
+        command = cf.command,
+        output = cf.output_digest,
+    )
+}
+
 /// Cap a partial-diff snapshot to a forensically-useful size for the terminal
 /// event payload (ADR-006). Longer diffs are truncated with a marker.
 fn cap_diff(diff: &str) -> String {
@@ -1959,9 +2080,19 @@ fn run_gate_and_verify(
             .to_string();
             emit(state, task_id, EventKind::ChecksFailed, Some(&payload));
             // Counts as a verification failure (ADR-003). No verifier ran, so no
-            // report; carry the diff for the next attempt's context.
+            // report; carry the diff for the next attempt's context. AND carry the
+            // failing command+output as a fix-in-place hint (L15): the next
+            // same-tier attempt reuses THIS worktree (edits intact) and injects
+            // this so the worker fixes the specific error instead of rewriting.
             let diff = worktree::diff(worktree_path, scope_base).unwrap_or_default();
-            Ok(AttemptOutcome::VerificationFailed { diff, report: None })
+            Ok(AttemptOutcome::VerificationFailed {
+                diff,
+                report: None,
+                check_failure: Some(CheckFailure {
+                    command,
+                    output_digest,
+                }),
+            })
         }
         GateOutcome::Passed { changed } => {
             emit(state, task_id, EventKind::ChecksPassed, None);
@@ -2011,9 +2142,13 @@ fn run_gate_and_verify(
                 }
                 Verdict::Fail => {
                     emit(state, task_id, EventKind::VerifyFailed, None);
+                    // A MODEL verify_failed (not a mechanical checks_failed): no
+                    // fix-in-place hint — the next attempt gets a fresh worktree
+                    // and re-implements with the verifier's report as context.
                     Ok(AttemptOutcome::VerificationFailed {
                         diff,
                         report: Some(report),
+                        check_failure: None,
                     })
                 }
             }
@@ -2640,6 +2775,26 @@ roles.tier1 = { model = "qwen", kind = "openai_compat", base_url = "http://local
             effective_turn_cap(&rp, &recipe_with_downgraded(true), &anthropic, &spec_with_turns(Some(1))),
             1
         );
+    }
+
+    // L15: the fix-in-place preamble names the failing command + its output and
+    // instructs the worker to make the SMALLEST fix rather than rewrite. This is
+    // the context injected into the next attempt after a `checks_failed`.
+    #[test]
+    fn check_fix_preamble_names_command_output_and_says_do_not_rewrite() {
+        let cf = CheckFailure {
+            command: "cargo build -p mycrate".into(),
+            output_digest: "error[E0382]: use of moved value: `parser`".into(),
+        };
+        let p = check_fix_preamble(&cf);
+        // The failing command and its output are both present verbatim.
+        assert!(p.contains("cargo build -p mycrate"), "names the failing command");
+        assert!(p.contains("use of moved value"), "includes the error output");
+        // It steers toward a targeted fix, not a rewrite, and tells the worker its
+        // edits are already present in the worktree.
+        assert!(p.contains("do NOT rewrite") || p.contains("do NOT start over"));
+        assert!(p.contains("ALREADY PRESENT"), "worker's edits are present");
+        assert!(p.contains("SMALLEST"), "asks for the smallest targeted change");
     }
 
     #[test]

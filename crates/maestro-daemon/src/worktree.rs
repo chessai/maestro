@@ -29,6 +29,35 @@ pub fn worktree_path(task_id: &str) -> PathBuf {
     worktrees_root().join(task_id)
 }
 
+/// Whether the task's existing worktree can be REUSED in place for a
+/// fix-in-place retry (operating-lesson L15), rather than cutting a fresh one off
+/// `base_ref`. `true` iff the conventional worktree dir exists on disk AND `git`
+/// still registers it as a valid worktree of `repo` (its `.git` link resolves).
+///
+/// This is the guard for the `checks_failed` retry path: when the prior attempt
+/// left near-complete edits that only tripped a check command, the next attempt
+/// keeps THOSE edits (this returns `true`) instead of discarding them via
+/// [`create`]. Best-effort: any git error or a missing/torn-down worktree → the
+/// caller falls back to a fresh [`create`], so the reuse is always safe.
+pub fn reuse(_repo_path: &Path, task_id: &str) -> bool {
+    is_live_worktree(&worktree_path(task_id))
+}
+
+/// Whether `wt` is a live git working tree that can be reused in place: it exists
+/// on disk AND `git -C <wt> rev-parse --is-inside-work-tree` succeeds (its gitdir
+/// link resolves back into the parent repo). A stale dir whose administrative
+/// worktree entry was pruned fails this → the caller cuts a fresh worktree. Split
+/// out of [`reuse`] so it is unit-testable without the state-dir env.
+fn is_live_worktree(wt: &Path) -> bool {
+    if !wt.exists() {
+        return false;
+    }
+    let Some(wt_str) = wt.to_str() else {
+        return false;
+    };
+    git_ok(wt_str, &["rev-parse", "--is-inside-work-tree"])
+}
+
 /// Run `git` with `args`, returning combined stdout/stderr on success or an
 /// error carrying the captured output on failure.
 fn git(args: &[&str]) -> Result<String> {
@@ -535,6 +564,39 @@ mod tests {
         let changed = changed_files(wt.path(), "HEAD").unwrap();
         assert_eq!(changed, vec!["new.txt".to_string()]);
         remove(repo.path(), wt.path());
+    }
+
+    // L15: `is_live_worktree` (the reuse guard) is TRUE for a live worktree and
+    // FALSE for a non-existent path or one that git no longer tracks. This is the
+    // predicate the fix-in-place retry uses to decide reuse vs a fresh cut.
+    #[test]
+    fn is_live_worktree_true_for_live_false_for_absent_or_removed() {
+        let repo = init_repo();
+        let rp = repo.path().to_str().unwrap();
+        let wt = TempDir::new().unwrap();
+        let wtp = wt.path().to_str().unwrap();
+
+        // A non-existent path → not reusable.
+        assert!(
+            !is_live_worktree(Path::new("/no/such/worktree/path")),
+            "absent path is not a live worktree"
+        );
+
+        // A live worktree with the worker's edits intact → reusable.
+        git(&["-C", rp, "worktree", "add", wtp, "-b", "maestro/reuse", "HEAD"]).unwrap();
+        std::fs::write(wt.path().join("edit.rs"), "// worker edits\n").unwrap();
+        assert!(
+            is_live_worktree(wt.path()),
+            "a live worktree is reusable in place"
+        );
+
+        // After git removes the worktree admin entry, the dir is no longer a live
+        // worktree → the caller falls back to a fresh cut.
+        remove(repo.path(), wt.path());
+        assert!(
+            !is_live_worktree(wt.path()),
+            "a removed worktree is not reusable"
+        );
     }
 
     #[test]
