@@ -1,0 +1,40 @@
+{
+  "title": "Fix off-by-one in Cursor::advance so it stops at EOF",
+  "tier": 1,
+  "base_ref": "main",
+  "file_allowlist": [
+    "crates/theseus-lexer/src/cursor.rs"
+  ],
+  "instructions": "Cursor::advance in crates/theseus-lexer/src/cursor.rs reads one byte past the end of the input on the final token, producing a spurious trailing token. Fix advance() so it returns None (and the lexer emits EOF) exactly at the input boundary. Edit cursor.rs in place; do not add new files or move code out of this file. Do NOT run cargo or nix yourself — the mechanical gate builds and runs the acceptance tests independently; get it right by reading the code carefully. If you believe the fix genuinely requires touching a file outside the allowlist, STOP and report why instead of editing out of scope.",
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "check": "cargo test -p theseus-lexer cursor::",
+      "kind": "command"
+    },
+    {
+      "id": "AC2",
+      "check": "The lexer emits exactly one EOF token and no trailing spurious token for a non-empty input ending without a newline.",
+      "kind": "invariant"
+    },
+    {
+      "id": "AC3",
+      "check": "cargo clippy -p theseus-lexer -- -D warnings",
+      "kind": "command"
+    }
+  ],
+  "check_commands": [
+    "cargo test -p theseus-lexer",
+    "cargo clippy -p theseus-lexer -- -D warnings"
+  ],
+  "house_rules_ref": null,
+  "budget": {
+    "turns": 25,
+    "tokens": null
+  },
+  "lifetime_budget": {
+    "tokens": null,
+    "wall_clock_minutes": 60
+  },
+  "containment_min": 1
+}
