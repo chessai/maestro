@@ -166,11 +166,23 @@ impl SessionHandle {
         *self.pid.lock().unwrap()
     }
 
-    /// How long since the PTY last produced output (ADR-009 Phase 2 liveness
-    /// signal). Mirrors the PTY reader's `last_output_at` — the same signal the
-    /// coarse `watchdog_minutes` uses inside the session, but readable from
-    /// outside (the daemon) for finer stall detection. Returns `Duration::ZERO`
-    /// if the slot has not been updated yet (the session just spawned).
+    /// ADR-009 Phase 2 liveness signal, readable from outside (the daemon) for
+    /// finer stall detection than the coarse in-session `watchdog_minutes`.
+    ///
+    /// **The meaning of "idle" is adapter-specific.** Generic single-phase
+    /// adapters mirror the PTY reader's `last_output_at` here, so `idle()` is
+    /// time-since-PTY-output. The two-phase Claude adapter deliberately does
+    /// NOT: a thinking `claude` worker can go minutes without emitting on the
+    /// PTY while very much alive, so mirroring PTY-silence caused BLOCKER-1
+    /// false stalls. Instead that adapter stamps `Instant::now()` every
+    /// supervision-loop iteration while the child is alive (see
+    /// `claude.rs::run_json_phase`), making `idle()` a *process-aliveness*
+    /// signal there — it only grows once the child has actually exited. The
+    /// coarse watchdog remains the backstop for a truly wedged (alive but
+    /// making-no-progress) worker.
+    ///
+    /// Returns `Duration::ZERO` if the slot has not been updated yet (the
+    /// session just spawned).
     pub fn idle(&self) -> Duration {
         self.idle_slot.lock().unwrap().elapsed()
     }

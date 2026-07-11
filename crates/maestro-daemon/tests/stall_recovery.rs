@@ -25,6 +25,16 @@ use maestro_journal::domain::Tier;
 use maestro_journal::proto::{Request, Response};
 use maestro_journal::spec::{AcceptanceCriterion, CriterionKind, TaskSpec};
 
+/// Both tests in this file mutate process-global env (`XDG_*`,
+/// `MAESTRO_STALL_TIMEOUT_SECONDS`, `MAESTRO_PROFILE`, …). Cargo runs the two
+/// `#[test]` fns on separate threads of the same process by default, so without
+/// this guard they race on that shared env — one test's `XDG_*` clobbers the
+/// other's mid-run and both journals cross-contaminate. Serialize the whole body
+/// of each test on this lock. Recover from poison (a panicking test still
+/// releases the env to the next) so one failure doesn't cascade into a bogus
+/// second failure.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn unique_tmp() -> PathBuf {
     let base = std::env::temp_dir();
     let name = format!(
@@ -153,6 +163,7 @@ fn write_fake_cli(dir: &Path, name: &str, body: &str) -> String {
 
 #[test]
 fn m_adr009_stall_detected_and_auto_recovered() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = unique_tmp();
     std::env::set_var("XDG_RUNTIME_DIR", &tmp);
     std::env::set_var("XDG_DATA_HOME", &tmp);
@@ -349,6 +360,7 @@ roles.verifier_floor = "mock"
 /// prove the fix distinguishes alive-but-slow from wedged.
 #[test]
 fn m_adr009_active_claude_worker_not_false_stalled() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = unique_tmp();
     std::env::set_var("XDG_RUNTIME_DIR", &tmp);
     std::env::set_var("XDG_DATA_HOME", &tmp);

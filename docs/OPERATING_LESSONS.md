@@ -408,3 +408,33 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
      retries + escalation up to the top); pin the top tier only for genuinely
      one-shot work.
 - Reflected in the `maestro-advisor` skill (§Monitoring discipline).
+
+### L18. Adapter liveness ≠ PTY output — a thinking `claude` worker is silent but alive (BLOCKER-1)
+- **Observed:** ADR-009 Phase 2's fine stall detector polls `SessionHandle::idle()`,
+  which for every adapter mirrored the PTY reader's `last_output_at`. The two-phase
+  `claude` adapter running `--output-format stream-json` goes **PTY-silent for
+  minutes** while the model is thinking (waiting on the API) — fully alive and
+  working, but emitting nothing on the tty. With a short stall timeout the daemon
+  read that silence as a stall → killed the session → retried → the next attempt
+  went silent again → a kill/retry loop to **zero progress**. The config workaround
+  was to raise `stall_timeout_seconds` to ~1740 (i.e. neuter the fine detector).
+- **Root cause:** "time since last PTY byte" is a valid liveness proxy for a chatty
+  single-phase worker but a **false** one for a structured worker whose quiet
+  periods are normal. Liveness is adapter-specific; the signal was not.
+- **Fix:** the `claude` adapter no longer mirrors `last_output_at`. Its supervision
+  loop stamps `idle_slot = Instant::now()` every iteration **while the child is
+  alive** (the loop running at all IS the liveness signal), so `idle()` only grows
+  once the child has exited. Documented on `SessionHandle::idle()` as an
+  adapter-specific contract. Generic adapters still mirror PTY output.
+- **Accepted cost (follow-up):** this makes the *fine* detector effectively inert
+  for `claude` — an alive-but-no-progress worker (PTY-silent OR chattily looping)
+  is now caught only by the coarser wall-clock ceilings (per-phase + attempt-level)
+  and the PTY-idle internal watchdog (silent wedges only). Eliminating the
+  false-positive was the priority; tighter true-positive detection (a real
+  progress signal — trace-kind advance, worktree growth — rather than either PTY
+  output or bare process-aliveness) is deferred.
+- **Meta-lesson:** BLOCKER-1 is itself a symptom of the ADR-009 stall feature having
+  been landed without an end-to-end test exercising a *realistic* worker's silence
+  profile — the same failure mode as L15. The negative integration test
+  (`m_adr009_active_claude_worker_not_false_stalled`) that reproduces a silent-then-
+  finishing `claude` worker is now the minimum bar for touching this path.

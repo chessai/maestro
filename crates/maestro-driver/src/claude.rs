@@ -485,7 +485,10 @@ fn run_json_phase(
     kill_rx: &Receiver<KillKind>,
     pid_slot: &Arc<Mutex<Option<i32>>>,
     env_remove: &[String],
-    // ADR-009 Phase 2: mirrored last-output timestamp for daemon-side stall detection.
+    // ADR-009 Phase 2: process-aliveness timestamp for daemon-side stall
+    // detection. Stamped to `Instant::now()` each supervision-loop iteration
+    // while the child is alive (NOT mirrored from PTY output — see the loop body
+    // for the BLOCKER-1 rationale).
     idle_slot: &Arc<Mutex<Instant>>,
 ) -> JsonPhaseOutcome {
     let args = json_phase_args(base_args, mode, prompt, max_budget_usd);
@@ -522,9 +525,17 @@ fn run_json_phase(
         // retry loop to zero progress.  The supervision loop itself IS the
         // liveness signal for the structured claude adapter: as long as this
         // loop is running (child alive, polling every POLL), the worker is live.
-        // The coarse internal watchdog (pty.idle() > watchdog, below) still
-        // catches genuinely wedged workers where the child is alive but the PTY
-        // produces no output for watchdog_minutes.
+        //
+        // TRADE-OFF (known gap, tracked as BLOCKER-1 follow-up item 5): this
+        // makes the daemon's fine stall detector effectively inert for claude
+        // workers — `idle()` only grows once the child exits. A worker that is
+        // alive but making NO real progress (either PTY-silent OR chattily
+        // looping) is now caught only by the coarser backstops: the per-phase
+        // wall-clock ceiling below (`wall_clock`) and the attempt-level
+        // wall-clock ceiling in the daemon. The internal PTY-idle watchdog
+        // (`pty.idle() > watchdog`, below) still fires for a PTY-silent wedge,
+        // but NOT for a chatty one. Correct false-positive elimination; weaker
+        // true-positive stall detection is the accepted cost until item 5.
         *idle_slot.lock().unwrap() = Instant::now();
 
         // Wall-clock ceiling (L4): bound the phase even when it is actively
