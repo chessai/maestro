@@ -216,6 +216,10 @@ pub fn run_claude_driven(
         // (ExitPlanMode submission if present, else all assistant text; empty if
         // none — the checker decides what an empty plan means).
         let plan = plan_out.plan_text;
+        // ADR-009 BLOCKER-1: keep idle signal fresh during inter-phase plan
+        // checking so the daemon's stall detector does not fire on the gap
+        // between phase 1 ending and phase 2 starting.
+        *idle_slot.lock().unwrap() = Instant::now();
         match checker.check(&plan, &spec) {
             PlanVerdict::Reject { reason } => {
                 // Plan rejected → NO phase 2, ZERO edits. Carry phase-1 metering.
@@ -508,8 +512,20 @@ fn run_json_phase(
     let kind = loop {
         // Parse any newly-buffered complete lines (updates state + cursor).
         parse_new_lines(&pty, &mut cursor, &mut state);
-        // Mirror PTY liveness to the external idle slot (ADR-009 Phase 2).
-        *idle_slot.lock().unwrap() = *pty.shared.last_output_at.lock().unwrap();
+        // ADR-009 BLOCKER-1 fix: stamp the external idle slot to Instant::now()
+        // on every supervision-loop iteration, not from pty.shared.last_output_at.
+        //
+        // Why: the claude CLI with --output-format stream-json can go silent for
+        // minutes during API thinking (waiting for the model to respond) while
+        // still being alive and working.  Mirroring last_output_at made the
+        // daemon's stall detector see that silence as a stall → false-kill →
+        // retry loop to zero progress.  The supervision loop itself IS the
+        // liveness signal for the structured claude adapter: as long as this
+        // loop is running (child alive, polling every POLL), the worker is live.
+        // The coarse internal watchdog (pty.idle() > watchdog, below) still
+        // catches genuinely wedged workers where the child is alive but the PTY
+        // produces no output for watchdog_minutes.
+        *idle_slot.lock().unwrap() = Instant::now();
 
         // Wall-clock ceiling (L4): bound the phase even when it is actively
         // emitting output (so the idle watchdog never fires). Checked first so a

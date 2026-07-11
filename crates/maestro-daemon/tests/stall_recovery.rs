@@ -333,3 +333,188 @@ roles.verifier_floor = "mock"
     handle.join().expect("server thread joins");
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// ADR-009 BLOCKER-1 negative test: a LIVE claude-adapter worker that is active
+/// (its supervision loop is running, child alive) but has output gaps LONGER
+/// than `stall_timeout` must NOT be StallDetected/killed.  It must run to
+/// normal completion with ZERO `stall_detected` events in the journal.
+///
+/// Without the idle-signal fix (stamping `Instant::now()` per supervision-loop
+/// iteration instead of mirroring `last_output_at`), the 5 s sleep in the
+/// execute-phase fake CLI exceeds the 3 s stall_timeout and the daemon
+/// false-kills the worker — exactly the production BLOCKER-1 scenario.
+///
+/// Together with [`m_adr009_stall_detected_and_auto_recovered`] (positive:
+/// a genuinely silent generic-adapter worker IS detected), these two tests
+/// prove the fix distinguishes alive-but-slow from wedged.
+#[test]
+fn m_adr009_active_claude_worker_not_false_stalled() {
+    let tmp = unique_tmp();
+    std::env::set_var("XDG_RUNTIME_DIR", &tmp);
+    std::env::set_var("XDG_DATA_HOME", &tmp);
+    std::env::set_var("XDG_CONFIG_HOME", &tmp);
+    std::env::set_var("XDG_STATE_HOME", &tmp);
+
+    // Short stall timeout so the test is fast.  The fake CLI's 5 s sleep in
+    // the execute phase exceeds this — without the fix the daemon would kill it.
+    std::env::set_var("MAESTRO_STALL_TIMEOUT_SECONDS", "3");
+    std::env::set_var("MAESTRO_WATCHDOG_SECONDS", "30");
+
+    let repo = init_repo(&tmp);
+    let repo_path = repo.to_string_lossy().to_string();
+
+    // --- Fake CLI scripts (stream-json output for the two-phase claude adapter) ---
+
+    // Plan phase: output an `assistant` event whose text contains "create"
+    // (MockPlanChecker accepts it) and a `result` event, then exit 0.
+    let plan_fake = write_fake_cli(
+        &tmp,
+        "plan.sh",
+        r#"
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"PLAN: create the implementation file"}]}}'
+echo '{"type":"result","result":"success"}'
+"#,
+    );
+
+    // Execute phase: create the implementation file, output an assistant event,
+    // then sleep 5 s (past the 3 s stall_timeout — simulating a long API
+    // thinking pause), output more events, and exit cleanly.
+    let exec_fake = write_fake_cli(
+        &tmp,
+        "exec.sh",
+        r#"
+mkdir -p src
+echo 'pub fn active_test() {}' > src/impl.rs
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Creating file."}]}}'
+# Simulate long API thinking: silence exceeds stall_timeout.
+sleep 5
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}'
+echo '{"type":"result","result":"success"}'
+"#,
+    );
+
+    // Dispatch: first invocation → plan, second → execute.
+    let dispatch_fake = write_fake_cli(
+        &tmp,
+        "dispatch_active.sh",
+        &format!(
+            r#"
+COUNTER="{counter}"
+if [ ! -f "$COUNTER" ]; then
+  echo 1 > "$COUNTER"
+  exec bash "{plan}"
+else
+  exec bash "{exec}"
+fi
+"#,
+            counter = tmp.join("active_attempt_counter").display(),
+            plan = plan_fake,
+            exec = exec_fake,
+        ),
+    );
+
+    // Config: claude adapter (two-phase stream-json), with stall detection on.
+    let cfg_dir = tmp.join("maestro");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::write(
+        cfg_dir.join("config.toml"),
+        format!(
+            r#"
+default_profile = "test"
+[defaults]
+concurrency.machine_cap = 4
+monitoring.stall_timeout_seconds = 3
+monitoring.stall_action = "snapshot_kill_retry"
+
+[profiles.test]
+roles.tier0 = {{ model = "mock", kind = "driven_cli", command = "bash", args = ["{dispatch}"], adapter = "claude" }}
+roles.tier1 = {{ model = "mock", kind = "driven_cli", command = "bash", args = ["{dispatch}"], adapter = "claude" }}
+roles.tier2 = {{ model = "mock", kind = "driven_cli", command = "bash", args = ["{dispatch}"], adapter = "claude" }}
+roles.verifier_floor = "mock"
+"#,
+            dispatch = dispatch_fake,
+        ),
+    )
+    .unwrap();
+    std::env::set_var("MAESTRO_PROFILE", "test");
+
+    let server = Server::start(Options {
+        profile: None,
+        detach: false,
+    })
+    .expect("server starts");
+    let socket = server.socket_path().to_path_buf();
+    let shutdown = server.shutdown_handle();
+    let handle = std::thread::spawn(move || server.serve_until().expect("serve loop"));
+    wait_for_socket(&socket, Duration::from_secs(5));
+
+    let advisor = match round_trip(
+        &socket,
+        &Request::RegisterAdvisor {
+            profile: Some("test".into()),
+        },
+    ) {
+        Response::RegisterAdvisor { advisor_session_id } => advisor_session_id,
+        other => panic!("expected RegisterAdvisor, got {other:?}"),
+    };
+
+    let spec = TaskSpec {
+        title: "active worker no-stall test".into(),
+        tier: Tier::T0,
+        base_ref: "HEAD".into(),
+        file_allowlist: vec!["src/impl.rs".into()],
+        instructions: "create src/impl.rs".into(),
+        acceptance_criteria: vec![
+            AcceptanceCriterion {
+                id: "AC1".into(),
+                check: "the implementation exists".into(),
+                kind: CriterionKind::Invariant,
+            },
+            AcceptanceCriterion {
+                id: "AC2".into(),
+                check: "mock:pass".into(),
+                kind: CriterionKind::Invariant,
+            },
+        ],
+        check_commands: vec!["test -f src/impl.rs".into()],
+        house_rules_ref: None,
+        budget: Default::default(),
+        lifetime_budget: Default::default(),
+        containment_min: 0,
+    };
+
+    let task = delegate(&socket, &advisor, &repo_path, spec);
+
+    // 60 s generous timeout: the execute phase sleeps 5 s then exits; the
+    // whole task should finish well within this limit.
+    let state = poll_terminal(&socket, &advisor, &task, Duration::from_secs(60));
+    assert_eq!(
+        state, "verify_passed",
+        "ADR-009 BLOCKER-1: a live claude-adapter worker with output gaps must NOT \
+         be stall-killed. Expected verify_passed, got '{state}'. Without the \
+         idle-signal fix the daemon false-kills the worker during the 5 s silence \
+         (stall_timeout = 3 s), loops to zero progress, and ends as 'blocked'."
+    );
+
+    let kinds = event_kinds(&task);
+
+    // The journal must NOT contain any stall_detected or auto_recovered events.
+    assert!(
+        !kinds.iter().any(|k| k == "stall_detected"),
+        "stall_detected must NOT appear for an active worker, got {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "auto_recovered"),
+        "auto_recovered must NOT appear for an active worker, got {kinds:?}"
+    );
+
+    // Verify the task reached verify_passed.
+    assert!(
+        kinds.iter().any(|k| k == "verify_passed"),
+        "verify_passed must be in the event chain, got {kinds:?}"
+    );
+
+    shutdown.store(true, Ordering::SeqCst);
+    handle.join().expect("server thread joins");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
