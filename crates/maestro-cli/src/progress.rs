@@ -4,10 +4,13 @@
 //! is only I/O + presentation: it fetches `TaskStatus`, renders the digests,
 //! and drives the blocking poll loop. No daemon protocol/control-flow change.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-use maestro_journal::progress::{state_class, suggested_action, watch_once, WatchTrigger};
+use maestro_journal::progress::{
+    state_class, suggested_action, watch_once, DigestLine, StateClass, WatchDigest, WatchTrigger,
+};
 use maestro_journal::proto::{PsRow, Request, Response};
 
 /// Outcome of a `watch` run, mapped to a process exit code by the caller.
@@ -16,6 +19,9 @@ pub enum WatchOutcome {
     Returned,
     /// The `--timeout` backstop fired before any return condition. Exit 2.
     TimedOut,
+    /// A tracked task has been stuck in a transient state longer than
+    /// `--stuck-timeout`. Exit 3.
+    Stuck,
 }
 
 /// Fetch the advisor's task rows via `Request::TaskStatus` (state filter=None).
@@ -136,7 +142,9 @@ pub fn render_status(tasks: &[PsRow]) -> String {
 /// `maestro watch`: block, polling `TaskStatus` every `interval`, until a
 /// tracked task is actionable OR all tracked tasks are terminal; then print the
 /// triggering digest and return [`WatchOutcome::Returned`]. `timeout` (optional)
-/// is a backstop → [`WatchOutcome::TimedOut`].
+/// is a backstop → [`WatchOutcome::TimedOut`]. `stuck_timeout` (optional)
+/// returns [`WatchOutcome::Stuck`] if any tracked task remains in a transient
+/// state continuously longer than the threshold.
 ///
 /// The tracked set is `explicit_tasks` if non-empty, else all of the advisor's
 /// tasks that are NON-TERMINAL at the first poll (a task already
@@ -144,6 +152,7 @@ pub fn render_status(tasks: &[PsRow]) -> String {
 ///
 /// `send`/`sleep`/`now` are injected so the loop is unit-testable with a scripted
 /// transport and a fake clock (no real daemon, no real sleeping).
+#[allow(clippy::too_many_arguments)] // send/sleep/now are injected for testability
 pub fn run_watch(
     send: &mut dyn FnMut(&Request) -> Result<Response>,
     sleep: &mut dyn FnMut(Duration),
@@ -152,9 +161,14 @@ pub fn run_watch(
     explicit_tasks: &[String],
     interval: Duration,
     timeout: Option<Duration>,
+    stuck_timeout: Option<Duration>,
 ) -> Result<WatchOutcome> {
     let start = now();
     let deadline = timeout.map(|t| start + t);
+
+    // Per-task state tracking for stuck detection: maps task_id →
+    // (last_seen_state, Instant when that state was first observed).
+    let mut state_since: HashMap<String, (String, Instant)> = HashMap::new();
 
     // First poll establishes the tracked set.
     let rows = fetch_tasks(send, advisor)?;
@@ -201,6 +215,9 @@ pub fn run_watch(
         return Ok(WatchOutcome::Returned);
     }
 
+    // Seed state_since from the first poll for stuck tracking.
+    update_state_since(&mut state_since, &rows, &tracked, start);
+
     loop {
         if let Some(dl) = deadline {
             if now() >= dl {
@@ -214,11 +231,85 @@ pub fn run_watch(
             }
         }
         sleep(interval);
+        let t_now = now();
         let rows = fetch_tasks(send, advisor)?;
         if let Some(digest) = watch_once(&rows, &tracked) {
             print!("{}", render_watch_digest(&digest, &tracked));
             return Ok(WatchOutcome::Returned);
         }
+
+        // Update state tracking and check for stuck tasks.
+        update_state_since(&mut state_since, &rows, &tracked, t_now);
+
+        if let Some(stuck_dur) = stuck_timeout {
+            if let Some(digest) = check_stuck(&state_since, &rows, &tracked, t_now, stuck_dur) {
+                print!("{}", render_watch_digest(&digest, &tracked));
+                return Ok(WatchOutcome::Stuck);
+            }
+        }
+    }
+}
+
+/// Update the per-task state-since tracker. If a task's state changed since the
+/// last observation, reset the timer to `now`. New tasks are seeded with `now`.
+fn update_state_since(
+    state_since: &mut HashMap<String, (String, Instant)>,
+    rows: &[PsRow],
+    tracked: &[String],
+    now: Instant,
+) {
+    for row in rows {
+        if !tracked.iter().any(|t| t == &row.task_id) {
+            continue;
+        }
+        match state_since.get(&row.task_id) {
+            Some((prev_state, _)) if *prev_state == row.state => {
+                // Same state — keep the existing timestamp.
+            }
+            _ => {
+                // New task or state changed — reset the timer.
+                state_since.insert(row.task_id.clone(), (row.state.clone(), now));
+            }
+        }
+    }
+}
+
+/// Check whether any tracked task has been stuck in a transient state for longer
+/// than `stuck_dur`. Returns a `WatchDigest` with `Stuck` trigger if so.
+fn check_stuck(
+    state_since: &HashMap<String, (String, Instant)>,
+    rows: &[PsRow],
+    tracked: &[String],
+    now: Instant,
+    stuck_dur: Duration,
+) -> Option<WatchDigest> {
+    let mut stuck_lines = Vec::new();
+    for row in rows {
+        if !tracked.iter().any(|t| t == &row.task_id) {
+            continue;
+        }
+        if state_class(&row.state) != StateClass::Transient {
+            continue;
+        }
+        if let Some((_, since)) = state_since.get(&row.task_id) {
+            let elapsed = now.duration_since(*since);
+            if elapsed >= stuck_dur {
+                stuck_lines.push(DigestLine {
+                    task_id: row.task_id.clone(),
+                    title: row.title.clone(),
+                    state: row.state.clone(),
+                    action: format!("stuck {}s in {}", elapsed.as_secs(), row.state),
+                });
+            }
+        }
+    }
+    if stuck_lines.is_empty() {
+        None
+    } else {
+        Some(WatchDigest {
+            trigger: WatchTrigger::Stuck,
+            lines: stuck_lines,
+        })
     }
 }
 
@@ -242,6 +333,9 @@ pub fn render_watch_digest(
                 return out;
             }
             out.push_str("watch: all tracked tasks are terminal:\n");
+        }
+        WatchTrigger::Stuck => {
+            out.push_str("watch: a tracked task appears stuck in a transient state:\n");
         }
     }
     for line in &digest.lines {
@@ -405,6 +499,7 @@ mod tests {
             &[],
             Duration::from_millis(1),
             Some(Duration::from_secs(3600)),
+            None,
         )
         .unwrap();
         assert!(matches!(out, WatchOutcome::Returned));
@@ -427,6 +522,7 @@ mod tests {
             &[],
             Duration::from_millis(1),
             None,
+            None,
         )
         .unwrap();
         assert!(matches!(out, WatchOutcome::Returned));
@@ -447,6 +543,7 @@ mod tests {
             "adv",
             &[],
             Duration::from_secs(5),
+            None,
             None,
         )
         .unwrap();
@@ -482,6 +579,7 @@ mod tests {
             &[],
             Duration::from_millis(1),
             Some(Duration::from_secs(10)),
+            None,
         )
         .unwrap();
         assert!(matches!(out, WatchOutcome::TimedOut), "should time out");
@@ -503,8 +601,112 @@ mod tests {
             &["A".to_string()],
             Duration::from_secs(5),
             None,
+            None,
         )
         .unwrap();
         assert!(matches!(out, WatchOutcome::Returned));
+    }
+
+    /// A task stuck in a transient state beyond --stuck-timeout triggers Stuck.
+    #[test]
+    fn watch_stuck_timeout_fires_when_transient_too_long() {
+        // Task stays in "iterating" while the clock advances past the stuck
+        // threshold. The state_since is seeded at t0 (start); the loop's
+        // second iteration sees t0+600s which exceeds the 300s threshold.
+        let mut script = Script::new(vec![
+            task_status(vec![row("A", "iterating")]), // first poll: tracked = {A}
+            task_status(vec![row("A", "iterating")]), // loop iter 1: still transient
+            task_status(vec![row("A", "iterating")]), // loop iter 2: still transient → stuck
+        ]);
+        let mut sleep = |_d: Duration| {};
+        let t0 = Instant::now();
+        let mut calls = 0u32;
+        // now() is called: (1) start, (2) loop iter 1 t_now, (3) loop iter 2 t_now.
+        // No deadline calls because timeout=None.
+        let mut now = || {
+            calls += 1;
+            match calls {
+                1 => t0,                            // start (seeds state_since)
+                2 => t0 + Duration::from_secs(5),   // loop iter 1: 5s < 300s, no stuck
+                _ => t0 + Duration::from_secs(600), // loop iter 2: 600s > 300s, stuck!
+            }
+        };
+        let out = run_watch(
+            &mut |r| script.send(r),
+            &mut sleep,
+            &mut now,
+            "adv",
+            &[],
+            Duration::from_millis(1),
+            None,
+            Some(Duration::from_secs(300)), // stuck threshold = 300s
+        )
+        .unwrap();
+        assert!(matches!(out, WatchOutcome::Stuck), "should detect stuck task");
+    }
+
+    /// A task that changes state before the stuck timeout does NOT trigger Stuck.
+    #[test]
+    fn watch_stuck_timeout_does_not_fire_when_state_changes() {
+        // Task changes state each poll, so the stuck timer resets each time.
+        // The clock advances, but never 300s within a single state.
+        let mut script = Script::new(vec![
+            task_status(vec![row("A", "created")]),       // first poll
+            task_status(vec![row("A", "iterating")]),     // state changed
+            task_status(vec![row("A", "checks_failed")]), // state changed again
+            task_status(vec![row("A", "verify_passed")]), // actionable → return
+        ]);
+        let mut sleeps = 0u32;
+        let mut sleep = |_d: Duration| sleeps += 1;
+        let t0 = Instant::now();
+        let mut calls = 0u32;
+        let mut now = || {
+            calls += 1;
+            // Each poll 100s apart — total 300s, but per-state never exceeds 100s.
+            t0 + Duration::from_secs((calls as u64).saturating_sub(1) * 100)
+        };
+        let out = run_watch(
+            &mut |r| script.send(r),
+            &mut sleep,
+            &mut now,
+            "adv",
+            &[],
+            Duration::from_millis(1),
+            None,
+            Some(Duration::from_secs(300)),
+        )
+        .unwrap();
+        // Should return Returned (actionable), not Stuck.
+        assert!(matches!(out, WatchOutcome::Returned));
+    }
+
+    /// Without --stuck-timeout, a long-transient task does NOT trigger Stuck.
+    #[test]
+    fn watch_no_stuck_timeout_ignores_long_transient() {
+        // Task stays transient and clock jumps, but no stuck_timeout is set.
+        // The backstop timeout fires instead.
+        let mut script = Script::new(vec![
+            task_status(vec![row("A", "iterating")]),
+            task_status(vec![row("A", "iterating")]),
+        ]);
+        let mut sleep = |_d: Duration| {};
+        let t0 = Instant::now();
+        let mut calls = 0u32;
+        let mut now = || {
+            calls += 1;
+            if calls <= 1 { t0 } else { t0 + Duration::from_secs(9999) }
+        };
+        let out = run_watch(
+            &mut |r| script.send(r),
+            &mut sleep,
+            &mut now,
+            "adv",
+            &[],
+            Duration::from_millis(1),
+            Some(Duration::from_secs(10)),
+            None, // no stuck_timeout
+        )
+        .unwrap();
+        assert!(matches!(out, WatchOutcome::TimedOut), "should time out, not stuck");
     }
 }

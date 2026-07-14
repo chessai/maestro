@@ -99,6 +99,10 @@ enum Command {
         /// (code 2). Off by default (block indefinitely).
         #[arg(long)]
         timeout: Option<u64>,
+        /// Return (exit 3) if any tracked task stays in a transient state
+        /// continuously longer than this many seconds. Off by default.
+        #[arg(long)]
+        stuck_timeout: Option<u64>,
     },
     /// Close a `blocked` task, recording its outcome (ADR-003).
     CloseTask {
@@ -202,7 +206,8 @@ fn real_main() -> Result<()> {
             tasks,
             interval,
             timeout,
-        } => cmd_watch(profile, &advisor, &tasks, interval, timeout),
+            stuck_timeout,
+        } => cmd_watch(profile, &advisor, &tasks, interval, timeout, stuck_timeout),
         Command::CloseTask {
             advisor,
             task,
@@ -459,6 +464,7 @@ fn cmd_watch(
     tasks: &[String],
     interval: u64,
     timeout: Option<u64>,
+    stuck_timeout: Option<u64>,
 ) -> Result<()> {
     let mut send = |req: &Request| ensured_request(profile, req);
     let mut sleep = |d: std::time::Duration| std::thread::sleep(d);
@@ -471,12 +477,15 @@ fn cmd_watch(
         tasks,
         std::time::Duration::from_secs(interval.max(1)),
         timeout.map(std::time::Duration::from_secs),
+        stuck_timeout.map(std::time::Duration::from_secs),
     )?;
     match outcome {
         progress::WatchOutcome::Returned => Ok(()),
         // A backstop timeout is a distinct, non-error exit code (2) so a caller
         // can tell "decision due" (0) from "gave up waiting" (2).
         progress::WatchOutcome::TimedOut => std::process::exit(2),
+        // Stuck timeout is exit code 3 so the caller can distinguish it.
+        progress::WatchOutcome::Stuck => std::process::exit(3),
     }
 }
 

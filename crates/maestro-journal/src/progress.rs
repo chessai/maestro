@@ -65,6 +65,19 @@ pub fn state_class(state: &str) -> StateClass {
         EventKind::VerifyPassed | EventKind::Blocked | EventKind::Failed => StateClass::Actionable,
         // TERMINAL-DONE — nothing to do.
         EventKind::Merged => StateClass::Terminal,
+        // ACTIONABLE-DEAD — the task will NOT progress on its own; the advisor
+        // must intervene (diagnose / re-delegate).
+        //
+        // Interrupted: the daemon emits Interrupted then immediately Failed
+        // (startup.rs reconciliation / kill path in delegate.rs). If `watch`
+        // ever sees `interrupted` as the LATEST state, the daemon crashed
+        // between emitting the two events — the task is dead.
+        EventKind::Interrupted => StateClass::Actionable,
+        // Pruned: no outgoing transition exists in the daemon state machine
+        // (the variant is defined but never emitted as of this writing). If a
+        // task is ever pruned, it is dead and the advisor should re-delegate.
+        EventKind::Pruned => StateClass::Actionable,
+
         // TRANSIENT — the daemon is grinding this forward; do NOT wake.
         EventKind::Created
         | EventKind::Queued
@@ -80,8 +93,9 @@ pub fn state_class(state: &str) -> StateClass {
         | EventKind::VerifyStarted
         | EventKind::VerifyFailed
         | EventKind::Escalated
-        | EventKind::Interrupted
-        | EventKind::Pruned
+        // StallDetected: under SnapshotKillRetry (default), the daemon kills
+        // the stalled session and emits AutoRecovered → retry (up to 3x, then
+        // Blocked). Genuinely transient — the daemon IS processing it.
         | EventKind::StallDetected
         | EventKind::AutoRecovered => StateClass::Transient,
     }
@@ -95,6 +109,8 @@ pub fn suggested_action(state: &str) -> Option<&'static str> {
         "verify_passed" => Some("merge"),
         "blocked" => Some("diagnose"),
         "failed" => Some("diagnose"),
+        "interrupted" => Some("diagnose"),
+        "pruned" => Some("re-delegate"),
         _ => None,
     }
 }
@@ -118,6 +134,9 @@ pub enum WatchTrigger {
     Actionable,
     /// Every tracked task reached a terminal (resting) state; none is actionable.
     AllTerminal,
+    /// A tracked task has been stuck in a transient state longer than the
+    /// `--stuck-timeout` threshold. The advisor should investigate.
+    Stuck,
 }
 
 /// A `watch` return digest: the trigger and the task line(s) that explain it.
@@ -258,8 +277,9 @@ mod tests {
             );
         }
 
-        // The expected partition, verbatim from ADR-009.
-        let actionable = ["verify_passed", "blocked", "failed"];
+        // The expected partition. Interrupted and Pruned are actionable-dead:
+        // no outgoing daemon transition, the advisor must intervene.
+        let actionable = ["verify_passed", "blocked", "failed", "interrupted", "pruned"];
         let terminal = ["merged"];
 
         for &k in ALL {
@@ -300,9 +320,9 @@ mod tests {
             .iter()
             .filter(|k| state_class(k.as_str()) == StateClass::Transient)
             .count();
-        assert_eq!(n_actionable, 3, "exactly 3 actionable states");
+        assert_eq!(n_actionable, 5, "exactly 5 actionable states");
         assert_eq!(n_terminal_only, 1, "exactly 1 terminal-only state (merged)");
-        assert_eq!(n_transient, ALL.len() - 4, "the rest are transient");
+        assert_eq!(n_transient, ALL.len() - 6, "the rest are transient");
     }
 
     /// An unknown/garbage state defaults to transient (never wakes the advisor).
@@ -325,13 +345,15 @@ mod tests {
 
     #[test]
     fn watch_keeps_polling_while_transient() {
-        // checks_failed / verify_failed / escalated are mid-flight, NOT actionable.
+        // checks_failed / verify_failed / escalated / stall_detected are
+        // mid-flight, NOT actionable.
         for st in [
             "created",
             "iterating",
             "checks_failed",
             "verify_failed",
             "escalated",
+            "stall_detected",
         ] {
             let rows = vec![row("A", st)];
             let tracked = vec!["A".to_string()];
@@ -339,6 +361,22 @@ mod tests {
                 watch_once(&rows, &tracked).is_none(),
                 "watch must keep polling while {st}"
             );
+        }
+    }
+
+    /// Dead states (interrupted / pruned) are actionable — the task will NOT
+    /// progress on its own and the advisor must intervene.
+    #[test]
+    fn watch_returns_on_dead_states() {
+        for (st, expected_action) in [("interrupted", "diagnose"), ("pruned", "re-delegate")] {
+            let rows = vec![row("A", st)];
+            let tracked = vec!["A".to_string()];
+            let d = watch_once(&rows, &tracked).unwrap_or_else(|| {
+                panic!("watch must wake on dead state {st}")
+            });
+            assert_eq!(d.trigger, WatchTrigger::Actionable, "{st} triggers Actionable");
+            assert_eq!(d.lines.len(), 1);
+            assert_eq!(d.lines[0].action, expected_action, "{st} action");
         }
     }
 
