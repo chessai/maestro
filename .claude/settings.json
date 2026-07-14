@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(env:*)",
+      "Bash(nix:*)",
+      "Bash(cargo:*)",
+      "Bash(rustc:*)",
+      "Bash(bash:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git restore:*)"
+    ]
+  }
+}
