@@ -186,6 +186,16 @@ Non-negotiables the daemon enforces:
 - **Parallelism (L11):** disjoint-file concurrent tasks merge cleanly; the risk is
   **shared files** (`Cargo.lock`, root `Cargo.toml`). Keep concurrent tasks on
   disjoint files, or pre-wire shared-file changes into the base before fan-out.
+- **Every finding ships with a test that reproduces it (L20).** When adversarial
+  review (or any diagnosis) surfaces a bug or a coverage gap, the fix must include a
+  test that **reproduces** the specific failure — it goes red without the fix and
+  green with it — and lands in the durable suite so the bug cannot silently return.
+  Scope + delegate that regression test *as part of* the fix, not as a follow-up. A
+  structural/assertion-only correction with no reproducing test is the L15/L19
+  anti-pattern ("the assertion is there" ≠ the assertion can fire). For a
+  **validator/certificate/oracle**, the reproducing test is a **mutation/negative
+  test**: corrupt the input and assert it is *rejected* — a checker that has never
+  returned an error has never been tested.
 
 ## 6. When something looks wrong
 
