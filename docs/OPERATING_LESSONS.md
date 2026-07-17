@@ -467,3 +467,32 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   test asserts `real == reference`. Never let a proxy the implementer wrote be the
   sole authority. **Review rule:** for any task whose acceptance is a differential/
   oracle test, verify *what the oracle runs against* before trusting a green result.
+
+### L20. A finding must ship with a test that reproduces it — a structural fix alone is insufficient — rule (advisor behavior)
+
+- **Rule:** when adversarial review (or any diagnosis) surfaces a bug or a
+  coverage gap, the fix MUST include a test that (a) **reproduces the specific
+  failure** — it FAILS without the fix and passes with it — and (b) lands in the
+  **durable suite** so the bug cannot silently return. Scope and delegate that
+  test AS PART OF the fix, not as a follow-up afterthought.
+- **Why:** a structural or assertion-only correction with no reproducing test is
+  the L15 anti-pattern (green unit helpers that never ran the real failure
+  sequence) and the L19 anti-pattern (a checker that cannot fail). "The assertion
+  is there" is not evidence the assertion can ever fire. Without a test that
+  actually goes red on the known-bad case, you have no proof the fix is
+  load-bearing — and no alarm if a later change silently re-introduces the bug.
+- **How, by fix type:**
+  - **Plain bug fix →** a test exercising the exact input or sequence that broke.
+    It must fail on the pre-fix code and pass on the post-fix code.
+  - **Validator / certificate / oracle fix →** a **mutation or negative test**:
+    corrupt the input (or feed the known-bad case) and assert the validator
+    **rejects** it — proving its teeth are real, not self-fulfilling. A validator
+    that has never rejected anything has never been tested (L19).
+  - **Weak / vacuous test discovered (e.g. a sampled tier that duplicated the
+    fast tier) →** widen it to genuinely exercise the gap, and keep a fast
+    companion for CI; the authoritative variant can be `#[ignore]`d and run
+    pre-merge.
+- **Cross-references:** L15 (fix-in-place loss-loop — the canonical case of
+  green helpers that missed the real round-trip), L15b (durability must not ride
+  on uncommitted state), L16 (acceptance must be independent of worker-written
+  tests), L19 (a self-written checker is not an oracle).

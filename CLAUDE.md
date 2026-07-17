@@ -33,7 +33,10 @@ on the checks-*passed* path), so on the fix-in-place retry the uncommitted worki
 tree was reset back to base and re-implemented from scratch — a loss-loop, the
 exact failure L15 was meant to prevent. No unit test caught it because none ran a
 worker→gate→checks_failed→retry round-trip against a real worktree. That end-to-end
-test is now the minimum bar for touching this code.
+test is now the minimum bar for touching this code. More generally, every bug that
+adversarial review surfaces must ship with a regression test that **reproduces** the
+specific finding (fails without the fix, passes with it) — this applies to every
+finding, not just the initial change (L20).
 
 ## Where the durable knowledge lives
 
