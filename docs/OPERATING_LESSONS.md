@@ -496,3 +496,34 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   green helpers that missed the real round-trip), L15b (durability must not ride
   on uncommitted state), L16 (acceptance must be independent of worker-written
   tests), L19 (a self-written checker is not an oracle).
+
+### L21. Every review — DESIGN phase included — is durably captured and its findings tracked to tests — rule (advisor behavior)
+
+- **Rule:** the advisor runs adversarial reviews at TWO points — the **design**,
+  before delegation, and the **implementation**, before merge. BOTH are subject
+  to L20, and BOTH must be **durably captured**:
+  - **(a) Commit the review verbatim** at the time it is produced — e.g.
+    `docs/reviews/<milestone>-<design|impl>.md` in the target repo. The Agent-tool
+    review transcripts live in an **ephemeral per-session `/tmp` dir** as raw JSONL;
+    do NOT rely on them surviving. If the review isn't committed, it didn't happen.
+  - **(b) Track every finding to a test.** Keep a finding→test index (verdict, each
+    numbered finding, its reproducing test, or an explicit *not-tested-because-X*
+    justification). At merge, gate on "every finding has a test or a justified
+    exception."
+- **Design-review findings are as load-bearing as implementation-review findings.**
+  A design finding usually becomes a **design change or a reject-guard** rather than
+  a code-fix-with-obvious-repro — which makes it easy to ship untested. L20 still
+  applies: a reject-guard needs a test proving it **fires** on the rejected case.
+- **Why:** on the M-D control-track work an audit found two review findings — the
+  F-5 loop-carrier leaf-count guard and the **F6 Swapbr-in-loop-body reject
+  (explicitly flagged as untested by the implementation review, and still shipped
+  without a test)** — had no reproducing test, because both were design-phase
+  policies folded into guards, not code fixes. And the reviews themselves survived
+  only in ephemeral `/tmp` JSONL. Undurable reviews + design findings that dodge L20
+  = silent erosion of the exact safety net that orchestration changes depend on.
+- **How to apply:** at each review — (1) commit the verbatim review; (2) create/update
+  the finding→test index; (3) at merge, verify the index is complete. Instruct Fable
+  reviewers that *their final message MUST be the complete review* (they sometimes end
+  without it) and **save that message immediately** — verify on disk.
+- **Cross-references:** L20 (a reproducing test per finding), L16 (independent
+  acceptance), L19 (authoritative oracle), L17 (advisor must actively monitor).

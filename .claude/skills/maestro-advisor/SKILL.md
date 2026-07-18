@@ -196,6 +196,17 @@ Non-negotiables the daemon enforces:
   **validator/certificate/oracle**, the reproducing test is a **mutation/negative
   test**: corrupt the input and assert it is *rejected* — a checker that has never
   returned an error has never been tested.
+- **Reviews are durably captured; DESIGN-review findings become tests too (L21).**
+  Run adversarial reviews at BOTH points — the **design** (before delegation) and the
+  **implementation** (before merge) — and treat them identically: (1) **commit the
+  review verbatim** (`docs/reviews/<milestone>-<design|impl>.md` in the target repo) —
+  the Fable transcripts live in an ephemeral `/tmp` session dir, so if it isn't
+  committed it's lost; (2) keep a **finding→test index** (each finding → its
+  reproducing test or a justified *not-tested-because*); (3) at merge, gate on the
+  index being complete. Design findings usually become a **design change or a
+  reject-guard**, which makes them easy to ship untested — L20 still binds: a
+  reject-guard needs a test proving it **fires**. Instruct reviewers "your final
+  message MUST be the complete review" and save it immediately (verify on disk).
 
 ## 6. When something looks wrong
 
