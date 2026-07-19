@@ -2161,7 +2161,13 @@ fn cap_diff(diff: &str) -> String {
     if diff.len() <= CAP {
         diff.to_string()
     } else {
-        let mut s = diff[..CAP].to_string();
+        // Truncate at the largest char boundary ≤ CAP; a raw `diff[..CAP]`
+        // byte slice panics when CAP lands inside a multibyte char.
+        let mut end = CAP;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut s = diff[..end].to_string();
         s.push_str("\n…[truncated]");
         s
     }

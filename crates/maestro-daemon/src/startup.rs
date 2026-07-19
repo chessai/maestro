@@ -220,8 +220,38 @@ fn cap_diff(diff: &str) -> String {
     if diff.len() <= CAP {
         diff.to_string()
     } else {
-        let mut s = diff[..CAP].to_string();
+        // Truncate at the largest char boundary ≤ CAP; a raw `diff[..CAP]`
+        // byte slice panics when CAP lands inside a multibyte char (e.g. a
+        // box-drawing `─`, 3 bytes, straddling the cap in a review diff).
+        let mut end = CAP;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut s = diff[..end].to_string();
         s.push_str("\n…[truncated]");
         s
+    }
+}
+
+#[cfg(test)]
+mod cap_diff_tests {
+    use super::cap_diff;
+
+    #[test]
+    fn cap_diff_truncates_at_char_boundary_not_mid_multibyte() {
+        // A `─` (U+2500, 3 bytes) starting at byte 3998 straddles the 4000-byte
+        // cap; a raw `diff[..4000]` slice panics mid-char (the startup crash this
+        // fixes). cap_diff must walk back to the char boundary at 3998.
+        let diff = "a".repeat(3998) + "─" + &"b".repeat(100);
+        assert!(!diff.is_char_boundary(4000)); // precondition: cap is mid-char
+        let capped = cap_diff(&diff); // must not panic
+        assert!(capped.ends_with("…[truncated]"));
+        assert_eq!(&capped[..3998], &"a".repeat(3998));
+    }
+
+    #[test]
+    fn cap_diff_passes_short_diffs_through() {
+        let diff = "short diff with a ─ box char";
+        assert_eq!(cap_diff(diff), diff);
     }
 }
