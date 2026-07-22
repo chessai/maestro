@@ -82,6 +82,15 @@ maestro logs <TASK_ID>          # the worker's captured PTY log
 
 # 4. merge only a verify_passed task (fast-forward or clean 3-way; conflicts refuse)
 maestro merge-task --advisor <ADVISOR_ID> --task <TASK_ID>
+# ⚠️  TIERED/SCOPED GATE → YOU OWN THE FULL VERIFICATION BEFORE MERGE.
+#   If a task's check_commands run only a FAST or SCOPED subset (e.g. a single
+#   `--test <bin>`, or a project's fast tier with slow binaries feature-gated),
+#   then `verify_passed` proves only that subset. Before merging you MUST run the
+#   full/heavy tier yourself — the real-authority (L19) tests the gate skipped —
+#   and any change-relevant heavy path. (theseus: `cargo test -p theseus-tisc
+#   --features heavy-tests -- --test-threads=1`; single-threaded is mandatory or
+#   concurrent GB-scale tests OOM. A #[ignore]d heavy test in a fast binary:
+#   `--test <bin> -- --ignored --test-threads=1`.) Merge only after it's green.
 
 # break-glass / control
 maestro kill <TASK_ID>          # interrupted_human, no model in the path
@@ -90,7 +99,7 @@ maestro ps                      # all tasks on the machine
 maestro close-task --advisor <ADVISOR_ID> --task <TASK_ID> --outcome abandoned|superseded [--successor <ID>]
 ```
 
-Terminal outcomes you'll see: `verify_passed` (merge it), `blocked` (top-tier
+Terminal outcomes you'll see: `verify_passed` (merge it — but see below), `blocked` (top-tier
 verify failed — respec/decompose/ask the human, then `close-task`), `failed`
 (carries one taxonomy kind — see `reference.md`). A `failed` with an external
 quota/rate-limit reason is **not a bug**; it's re-runnable after reset.
