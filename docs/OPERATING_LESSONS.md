@@ -9,8 +9,8 @@ not rely on ephemeral advisor memory.
 Status legend: **FIXED** (landed in code) · **open** (not yet done) ·
 **rule** (operational discipline until/unless codified).
 
-Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
-(2026-07-09).
+Provenance: mtg-engine card-impl runs (2026-07-08/09), theseus M1 runs
+(2026-07-09), and the gungi-az AlphaZero campaign (2026-08, L17–L25).
 
 ---
 
@@ -527,3 +527,77 @@ Provenance: mtg-engine card-impl runs (2026-07-08/09) and theseus M1 runs
   without it) and **save that message immediately** — verify on disk.
 - **Cross-references:** L20 (a reproducing test per finding), L16 (independent
   acceptance), L19 (authoritative oracle), L17 (advisor must actively monitor).
+
+### L22. Turn budget is a SPEC-SHAPING signal — `turn_budget_exceeded` means the spec spent turns on the wrong things, not that the cap was too low — rule (advisor behavior)
+
+- **Observed (gungi-az draft-curriculum chain, 2026-08-18):** three consecutive
+  tier-1 tasks died on their turn caps (30 → 45 → 80) with no stall and correct
+  partial work. The worker logs showed WHERE the turns went: (a) one attempt spent
+  **28 of 80 turns on auto-denied `Bash` calls** trying to run pytest/compile —
+  every denied call still costs a turn — despite a "the gate verifies the tests"
+  line buried mid-spec; (b) another spent its whole budget trying to read files
+  the spec named by **absolute path outside its worktree** (the sandbox blocks
+  that; the worker retried, escalated to `dangerouslyDisableSandbox`, and spawned
+  subagents); (c) the third was simply too large (a 3-seam Cython change + 6
+  behavioral tests in one spec).
+- **Rule:** (1) the **first paragraph** of `instructions` is a TURN ECONOMY block:
+  "every tool call costs a turn from a hard cap of N; Bash cannot run
+  python/pytest/compilers (auto-denied) — never verify by execution; don't Bash-grep,
+  Read whole files; no subagents." A warning buried lower is not read in time.
+  (2) Workers **cannot read outside their worktree** — inline any external content
+  (review docs, seed diffs, reference snippets) verbatim into the spec. (3) Size to
+  one mechanism per task (L8/L14): mechanism task, then wiring task, then telemetry
+  task — each landed first-try once split. (4) Raising the cap alone is the wrong
+  fix; the log's tool histogram tells you which of (1)–(3) applies.
+- **Cross-references:** L5 (workers can't self-verify), L8, L14, L23.
+
+### L23. Salvage-and-seed on a failed attempt — the journal's `partial_diff` is the ONLY surviving artifact, and it is truncated — rule + harness follow-up
+
+- **Observed:** on `turn_budget_exceeded` the worktree is reaped, so the worker's
+  correct-but-unfinished work survives only as `partial_diff` in the `failed`
+  payload — and that field is **truncated at ~4KB** (mid-function, mid-docstring).
+  Twice the salvaged fragment was still enough to seed the successor spec
+  ("apply this verbatim, then complete"), and the seeded successor passed
+  first-try each time; once (an 80-turn attempt) the fragment was a small
+  fraction of the real diff.
+- **Rule (advisor):** on any `failed`, before respeccing, extract `partial_diff`
+  from `journal-query --query trace`, save it, and seed the successor spec with it
+  + a "budget discipline" note about what the log shows the previous attempt wasted.
+- **Harness follow-up (open):** on `turn_budget_exceeded` (and other non-scope
+  terminal failures) preserve the full diff — either keep the branch/worktree
+  until the advisor closes the task, or store the complete diff as a journal blob
+  rather than a truncated inline string. An 80-turn attempt's output should never
+  reduce to a 4KB fragment.
+- **Cross-references:** L15/L15b (fix-in-place durability), L22.
+
+### L24. Freshness FIRST — a plausible-looking progress counter is not liveness; watchers exit on MILESTONES and HEARTBEATS, not only on failures — rule (advisor behavior)
+
+- **Observed:** a long-running supervised job (self-play training) OOM-wedged at
+  94% of an iteration. The advisor's status check read the last progress line —
+  "17870/24000" — and reported "healthy, on pace"; the line was 45 minutes stale.
+  The wedge cost ~1.5h of paid compute before detection. Separately, the user
+  reported *never* seeing an unprompted report: the watcher exited only on
+  failures, so a healthy 3-hour phase was indistinguishable from a dead advisor.
+- **Rule:** (1) every liveness check — manual or scripted — **leads with the
+  artifact's mtime age** (log, worktree file, journal event); a counter that hasn't
+  moved is a wedge, not progress. Encode it: `LOG_STALL` (age > N min AND process
+  alive) is a watcher exit condition. (2) Watchers must exit on **milestones**
+  (the thing you promised the user next) AND on a **periodic heartbeat** (~hourly)
+  so the advisor is re-invoked to post an unprompted status line; failure-only
+  watchers make the user the de-facto poller. (3) Every wake-up ends with a
+  visible user-facing report, even one line. (4) After any session restart,
+  re-arm every watcher first — queued notifications died with the process.
+- **Cross-references:** L17, L18 (PTY-silent ≠ dead — the mtime rule complements it:
+  check the artifact the worker *should* be producing, not only the PTY).
+
+### L25. `pkill`/`pgrep` self-match — bracket the pattern AND make the kill a lone command — note
+
+- **Observed (four times in one day):** `pkill -f 'p3_watch.sh'` killed the
+  advisor's own shell (exit 144) because the shell's cmdline contained the
+  pattern; a bracketed pattern `[p]3_watch` fixed the direct case but still
+  self-matched when the same compound command mentioned the filename elsewhere
+  (a `cp`, an `ls`, a `sed` target). Remote `pgrep -c` self-matching also made a
+  PROC_GONE detector dead for hours (it always counted ≥1).
+- **Rule:** kill by PID when known; otherwise bracket the pattern AND issue the
+  kill as its own command with no other mention of the name (or `base64`-decode
+  the pattern at runtime). For remote liveness counts always bracket.

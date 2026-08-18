@@ -236,6 +236,26 @@ Non-negotiables the daemon enforces:
   reject-guard**, which makes them easy to ship untested — L20 still binds: a
   reject-guard needs a test proving it **fires**. Instruct reviewers "your final
   message MUST be the complete review" and save it immediately (verify on disk).
+- **Turn budget is a spec-shaping signal (L22).** `turn_budget_exceeded` almost never
+  means "raise the cap." Read the worker log's tool histogram: denied `Bash` attempts
+  to run tests (each costs a turn), reads of paths **outside the worktree** (the
+  sandbox blocks them — inline external content verbatim into the spec), or a task
+  that is simply too big. Put a **TURN ECONOMY paragraph FIRST** in `instructions`
+  ("every tool call costs a turn of N; Bash cannot run python/pytest/compilers —
+  never verify by execution; Read whole files, don't Bash-grep; no subagents") and
+  split into mechanism → wiring → telemetry tasks.
+- **Salvage-and-seed on any `failed` (L23).** The worktree is reaped; the only artifact
+  is `partial_diff` in the journal's failure payload, **truncated ~4KB** — extract it
+  (`journal-query --query trace`) BEFORE respeccing and seed the successor spec with it
+  verbatim ("apply this, then complete"). Seeded successors landed first-try.
+- **Freshness first; milestone + heartbeat exits (L24).** Every liveness check leads
+  with the artifact's **mtime age** — a plausible progress counter that hasn't moved is
+  a wedge (one cost 1.5h of paid compute). Watchers exit on the **milestone you promised
+  the user** and on an **hourly heartbeat**, not only on failures; each wake-up ends with
+  a visible one-line report; re-arm all watchers after any session restart.
+- **`pkill`/`pgrep` self-match (L25).** Kill by PID; else bracket the pattern
+  (`[p]3_watch`) AND issue the kill as a lone command with no other mention of the
+  name in the compound. Remote liveness counts must bracket too.
 
 ## 6. When something looks wrong
 

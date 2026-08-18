@@ -41,7 +41,7 @@ finding, not just the initial change (L20).
 ## Where the durable knowledge lives
 
 - `docs/OPERATING_LESSONS.md` — the canonical, numbered record of hard-won
-  operating lessons (L1–L16). Read it before changing behavior it describes; add
+  operating lessons (L1–L25). Read it before changing behavior it describes; add
   to it (don't rewrite history) when a new lesson is earned.
 - `docs/PLAN.md`, `docs/adr/001`–`008` — architecture and rationale.
 - `.claude/skills/maestro-advisor/` — the advisor onboarding skill.
