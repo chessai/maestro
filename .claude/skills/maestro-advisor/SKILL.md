@@ -119,11 +119,31 @@ start of your job, not the end.
   read the failure and act (re-delegate the same spec — fix-in-place usually
   converges; respec; or record it for the human). Leaving a task `blocked` while
   you assume "it's working" is the classic advisor failure.
-- **Unattended runs need a mechanism that actually RE-INVOKES you** — a real
-  `/loop`, or a cron (`CronCreate`) firing your poll procedure on a schedule.
-  `ScheduleWakeup` fires ONLY inside a `/loop` runtime; used outside `/loop` it
-  schedules nothing that runs — your "loop" is dead and you won't know. **Verify
-  the first wake-up actually re-invokes you before trusting any unattended loop.**
+- **Unattended runs need a mechanism that actually RE-INVOKES you. PREFER a
+  background `Bash` watcher over `ScheduleWakeup`.** A `run_in_background: true`
+  Bash script that polls `maestro task-status` every ~60s and **exits** the moment
+  the task hits a terminal/mergeable state (or stalls) reliably re-invokes you: its
+  completion fires a `<task-notification>` — the same event path that background
+  `Agent` completions use, which fires dependably. On wake, merge + delegate the
+  next task + relaunch a watcher for it. This is the recommended unattended loop.
+  - **`ScheduleWakeup` (`/loop` dynamic mode) has been observed to NOT fire
+    autonomously** — a merge-ready task sat idle 24 min between manual check-ins
+    while the timer never re-invoked the advisor. Do not rely on it for maestro
+    progress. If you use it at all, **verify the first wake-up actually fires** (see
+    a delta happen with no external poke) before trusting it — and even then, a
+    background watcher is the safer default.
+  - A cron (`CronCreate`) only helps if it runs where the maestro **daemon** is; a
+    cloud-scheduled agent cannot reach a local daemon/socket, so it can't poll or
+    merge local tasks. Use the local background watcher instead.
+  - Watcher poll commands (`task-status`/`journal-query`/`merge-task`) talk to the
+    already-running daemon and do **not** need the daemon's gate toolchain (nix
+    devShell/venv) on their PATH — only the daemon's own spawn and `delegate` do.
+    So the watcher can call the `maestro` binary directly for a light poll.
+  - A reference watcher: poll `task-status` for the derived state; `exit 0` on
+    `verify_passed|blocked|failed|merged`; also track total worktree source-bytes
+    and `exit` after ~8 min of no growth (stall) so a wedged worker wakes you fast;
+    cap total runtime so it can't hang forever. Print a `WATCH_DONE|WATCH_STALL`
+    marker so the waking turn knows why it fired.
 - **Start resilient work at tier 0, not the top tier.** The top tier has no
   `checks_failed` retry/escalation budget — one trivial gate error (a lint, a
   wrong enum-variant name) → immediate `blocked`. Tier 0 gets fix-in-place retries
